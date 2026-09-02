@@ -50,11 +50,12 @@ const (
 	claudeExtendedCacheTTLBeta       = "extended-cache-ttl-2025-04-11"
 	claudeCacheDiagnosisBeta         = "cache-diagnosis-2026-04-07"
 	claudeRedactThinkingBeta         = "redact-thinking-2026-02-12"
+	claudeAFKModeBeta                = "afk-mode-2026-01-31"
 )
 
 // claudeCodeCLIConstantBetas are the betas Claude Code sends on every
 // /v1/messages request from the "cli" entrypoint, in wire order, excluding the
-// leading claude-code-20250219.
+// leading claude-code-20250219. The set and order are unchanged since 2.1.220.
 //
 // redact-thinking-2026-02-12 belongs here because cloaked requests always claim
 // cc_entrypoint=cli; the "sdk-cli" entrypoint omits it. It is still dropped for
@@ -82,6 +83,10 @@ var claudeCodeTrailingBetas = []string{
 //
 // Verified against api.anthropic.com with native 2.1.258 captures on interactive,
 // non-interactive, subagent, and multi-model paths (Sonnet, Opus, Fable, Haiku).
+// A 2026-09-02 capture on the cli and sdk-cli entrypoints with an OAuth credential
+// additionally confirmed that advanced-tool-use is emitted only while tool search
+// is active, and that afk-mode-2026-01-31 is forwarded between fast-mode and
+// extended-cache-ttl when the caller sends it.
 // The full observed order is:
 //
 //	 1 claude-code-20250219
@@ -94,15 +99,16 @@ var claudeCodeTrailingBetas = []string{
 //	 8 prompt-caching-scope-2026-01-05
 //	 9 mid-conversation-system-2026-04-07  models accepting a role=system turn
 //	10 advisor-tool-2026-03-01             requests declaring advisor tools or requesting advisor beta
-//	11 advanced-tool-use-2025-11-20       requests with tools
+//	11 advanced-tool-use-2025-11-20       requests using tool search or another advanced tool-use feature
 //	12 effort-2025-11-24                  effort-supporting models with active thinking
 //	13 server-side-fallback-2026-06-01    requests with fallbacks or requested
 //	14 fallback-credit-2026-06-01         OAuth credentials
 //	15 structured-outputs-2025-12-15      structured output requests
 //	16 thinking-display-updates-2026-08-18 requests with thinking.display=updates
 //	17 fast-mode-2026-02-01               speed:fast requests only
-//	18 extended-cache-ttl-2025-04-11      OAuth credentials (omitted on subagent & probe)
-//	19 cache-diagnosis-2026-04-07         requests with diagnostics only
+//	18 afk-mode-2026-01-31                auto-mode sessions, forwarded when the caller sends it
+//	19 extended-cache-ttl-2025-04-11      OAuth credentials (omitted on subagent & probe)
+//	20 cache-diagnosis-2026-04-07         requests with diagnostics only
 //
 // An empty body keeps the optimistic role=system default, matching the cloaking
 // policy for unknown and future model IDs.
@@ -128,7 +134,7 @@ func claudeCodeCLIBetas(body []byte, requested map[string]bool, oauthToken bool)
 	if requested[claudeAdvisorToolBeta] || claudeBodyHasAdvisorTool(body) {
 		betas = append(betas, claudeAdvisorToolBeta)
 	}
-	if tools := gjson.GetBytes(body, "tools"); tools.IsArray() && len(tools.Array()) > 0 {
+	if requested[claudeAdvancedToolUseBeta] || claudeBodyUsesAdvancedToolUse(body) {
 		betas = append(betas, claudeAdvancedToolUseBeta)
 	}
 	if claudeRequestSupportsEffort(body, requested) {
@@ -155,6 +161,9 @@ func claudeCodeCLIBetas(body []byte, requested map[string]bool, oauthToken bool)
 	}
 	if claudeRequestUsesFastMode(body, requested) {
 		betas = append(betas, claudeFastModeBeta)
+	}
+	if requested[claudeAFKModeBeta] {
+		betas = append(betas, claudeAFKModeBeta)
 	}
 	if oauthToken && !helps.IsClaudeSubagentRequest(nil, body) && !isProbeOrHelper {
 		betas = append(betas, claudeExtendedCacheTTLBeta)
@@ -192,6 +201,31 @@ func claudeRequestSupportsEffort(body []byte, requested map[string]bool) bool {
 func claudeThinkingDisplayUpdates(body []byte) bool {
 	display := gjson.GetBytes(body, "thinking.display")
 	return display.Type == gjson.String && strings.EqualFold(strings.TrimSpace(display.String()), "updates")
+}
+
+// claudeBodyUsesAdvancedToolUse reports whether the request needs
+// advanced-tool-use-2025-11-20. Claude Code 2.1.258 adds the beta only while
+// tool search is active, which puts a tool_search_tool_* server tool and
+// defer_loading tools on the wire; plain tool declarations no longer carry it
+// (measured 2026-09-02: 158 inline tools, no beta). Tool use examples
+// (input_examples) and programmatic tool calling (allowed_callers) sit behind
+// the same beta and are just as visible in the body, so callers using them keep
+// working without requesting the beta explicitly.
+func claudeBodyUsesAdvancedToolUse(body []byte) bool {
+	tools := gjson.GetBytes(body, "tools")
+	if !tools.IsArray() {
+		return false
+	}
+	for _, tool := range tools.Array() {
+		toolType := strings.ToLower(strings.TrimSpace(tool.Get("type").String()))
+		if strings.HasPrefix(toolType, "tool_search_tool_") {
+			return true
+		}
+		if tool.Get("defer_loading").Bool() || tool.Get("input_examples").Exists() || tool.Get("allowed_callers").Exists() {
+			return true
+		}
+	}
+	return false
 }
 
 // claudeBodyHasAdvisorTool reports whether the request body declares an
@@ -243,6 +277,9 @@ func claudeRequestUsesFastMode(body []byte, requested map[string]bool) bool {
 // /v1/messages/count_tokens. It is far smaller than the inference baseline:
 // redact-thinking, thinking-token-count, prompt-caching-scope, effort and every
 // conditional beta are absent. Verified identical across 37 captured calls.
+// Re-measured on 2.1.258 (2026-09-02, large-file Read pre-check): the same five
+// betas in the same order, a body of model, messages and tools only, and no
+// X-Stainless-Timeout.
 var claudeCountTokensBetas = []string{
 	claudeCodeBeta,
 	"interleaved-thinking-2025-05-14",
@@ -1063,22 +1100,22 @@ func applyClaudeHeadersWithNativeProfile(
 		}
 	}
 	// Per-request UUID, matches Claude Code's x-client-request-id for first-party API.
-	// identityHeader prefers the incoming value for a confirmed client, so a confirmed
-	// helper keeps its own native request ID and this fresh UUID only covers a caller
-	// that sent none. Helpers opt in on custom gateways too.
+	// Claude Code 2.1.258 attaches it only when its own base URL is api.anthropic.com,
+	// so a request that reached CPA never carries one and this fresh UUID restores the
+	// first-party shape; identityHeader still prefers an incoming value for a confirmed
+	// client. Helpers opt in on custom gateways too.
 	if isAnthropicBase || helperProfile {
 		identityHeader("x-client-request-id", uuid.New().String())
 	}
 	r.Header.Set("Connection", "keep-alive")
 	// Regular Claude Code requests negotiate transport identically for streaming
-	// and non-streaming requests. Measured Haiku helpers are the exception: their
-	// minimal non-stream request offers gzip only, while the structured streaming
-	// helper offers the full compression set. Confirmed helpers preserve the
-	// incoming native values.
+	// and non-streaming requests. Claude Code 2.1.258 Haiku helpers offer the same
+	// full compression set as the main thread; 2.1.220's minimal probe offered gzip
+	// only. Confirmed helpers preserve the incoming native values.
 	applyTransportNegotiation := func() {
 		if helperProfile {
 			identityHeader("Accept", "application/json")
-			identityHeader("Accept-Encoding", "gzip")
+			identityHeader("Accept-Encoding", "gzip, deflate, br, zstd")
 			return
 		}
 		if stream && !isAnthropicBase {
