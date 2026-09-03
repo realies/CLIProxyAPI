@@ -88,9 +88,11 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 
 	// Apply cloaking (system prompt injection, fake user ID, sensitive word obfuscation)
 	// based on client type and configuration.
-	_, wireSettings := resolveClaudeWirePolicy(e.cfg, auth, apiKey, confirmedClaudeCode)
+	wirePolicy, wireSettings := resolveClaudeWirePolicy(e.cfg, auth, apiKey, confirmedClaudeCode)
 	bodyBeforeCloaking := body
 	isProbeOrHelper := helps.IsClaudeProbeOrHelperRequest(bodyBeforeCloaking)
+	advisorBound := claudeRequestContainsAdvisorState(bodyBeforeCloaking)
+	cloakWouldApply := wirePolicy.Cloak
 	var cloaked bool
 	body, cloaked, err = applyCloakingInternal(
 		ctx,
@@ -157,6 +159,14 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		"diagnostics",
 	)
 	contextManagementState.payloadRuleTouched = touchedPayloadPaths["context_management"]
+	// Payload rules run exactly once. When this request is eligible for cloaking,
+	// adding or removing advisor state would change its treatment from the incoming
+	// first-turn contract, so reject instead of guessing and replaying rules. If the
+	// resolved wire policy is already cloak-off, no placement transition is possible.
+	if cloakWouldApply && claudeRequestContainsAdvisorState(body) != advisorBound {
+		log.Warn(claudeAdvisorRuleStateError)
+		return nil, statusErr{code: http.StatusBadRequest, msg: claudeAdvisorRuleStateError}
+	}
 	body = reconcileClaudeCodeSystemPlacementAfterPayload(body, systemPlacementState)
 	wasProbeOrHelper := isProbeOrHelper
 	isProbeOrHelper = helps.IsClaudeProbeOrHelperRequest(body)
