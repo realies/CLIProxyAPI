@@ -369,21 +369,50 @@ func mapConfiguredHighIntent(level ThinkingLevel, modelInfo *registry.ModelInfo)
 		return level
 	}
 	level = ThinkingLevel(strings.ToLower(strings.TrimSpace(string(level))))
-	var candidates []ThinkingLevel
-	switch level {
-	case LevelXHigh:
-		candidates = []ThinkingLevel{LevelXHigh, LevelMax, LevelHigh}
-	case LevelMax:
-		candidates = []ThinkingLevel{LevelMax, LevelXHigh, LevelHigh}
-	default:
+	if isLevelSupported(string(level), modelInfo.Thinking.Levels) {
 		return level
 	}
-	for _, candidate := range candidates {
+
+	// Max and xhigh are equivalent top-end intents across provider families.
+	// Prefer the counterpart before clamping to a lower portable level.
+	if level == LevelXHigh && isLevelSupported(string(LevelMax), modelInfo.Thinking.Levels) {
+		return LevelMax
+	}
+	if level == LevelMax && isLevelSupported(string(LevelXHigh), modelInfo.Thinking.Levels) {
+		return LevelXHigh
+	}
+	if !strings.EqualFold(strings.TrimSpace(modelInfo.Type), "openai-compatibility") {
+		if (level == LevelXHigh || level == LevelMax) && isLevelSupported(string(LevelHigh), modelInfo.Thinking.Levels) {
+			return LevelHigh
+		}
+		return level
+	}
+	if level == LevelMax {
+		level = LevelXHigh
+	}
+
+	requestedRank := -1
+	lowestRank := len(standardLevelOrder)
+	lowest := ThinkingLevel("")
+	for rank, candidate := range standardLevelOrder[:len(standardLevelOrder)-1] {
+		if candidate == level {
+			requestedRank = rank
+		}
+		if rank < lowestRank && isLevelSupported(string(candidate), modelInfo.Thinking.Levels) {
+			lowestRank = rank
+			lowest = candidate
+		}
+	}
+	if requestedRank < 0 || lowest == "" {
+		return level
+	}
+	for rank := requestedRank - 1; rank >= 0; rank-- {
+		candidate := standardLevelOrder[rank]
 		if isLevelSupported(string(candidate), modelInfo.Thinking.Levels) {
 			return candidate
 		}
 	}
-	return level
+	return lowest
 }
 
 func extractSourceThinkingConfig(body []byte, provider string) ThinkingConfig {
@@ -490,7 +519,19 @@ func applyUserDefinedModel(body []byte, modelInfo *registry.ModelInfo, fromForma
 		return body, nil
 	}
 
-	config = normalizeUserDefinedConfig(config, fromFormat, toFormat)
+	if modelInfo != nil && modelInfo.Thinking != nil && len(modelInfo.Thinking.Levels) > 0 {
+		if config.Mode == ModeBudget {
+			if level, ok := ConvertBudgetToLevel(config.Budget); ok {
+				config.Mode = ModeLevel
+				config.Level = ThinkingLevel(level)
+				config.Budget = 0
+			}
+		}
+		if config.Mode == ModeLevel {
+			config.Level = mapConfiguredHighIntent(config.Level, modelInfo)
+		}
+	}
+	config = normalizeUserDefinedConfig(config, fromFormat, toFormat, modelInfo)
 	log.WithFields(log.Fields{
 		"provider": toFormat,
 		"model":    modelID,
@@ -508,8 +549,11 @@ func applyUserDefinedModel(body []byte, modelInfo *registry.ModelInfo, fromForma
 	return applySummaryConfigForProvider(applied, toFormat, modelID, providerKey, modelInfo, summaryConfig), nil
 }
 
-func normalizeUserDefinedConfig(config ThinkingConfig, fromFormat, toFormat string) ThinkingConfig {
+func normalizeUserDefinedConfig(config ThinkingConfig, fromFormat, toFormat string, modelInfo *registry.ModelInfo) ThinkingConfig {
 	if config.Mode != ModeLevel {
+		return config
+	}
+	if modelInfo != nil && modelInfo.Thinking != nil && len(modelInfo.Thinking.Levels) > 0 {
 		return config
 	}
 	if toFormat == "claude" {
