@@ -505,6 +505,41 @@ func validateClaudeCallerSystemBlocks(system gjson.Result) error {
 	return blockErr
 }
 
+// claudeSignedHistoryBoundary returns the last message index containing a
+// server-managed block whose replay is bound to Anthropic's signed history.
+// A negative result means the request has no immutable history prefix.
+func claudeSignedHistoryBoundary(payload []byte) int {
+	boundary := -1
+	gjson.GetBytes(payload, "messages").ForEach(func(key, message gjson.Result) bool {
+		if claudeContentContainsSignedServerState(message.Get("content")) {
+			boundary = int(key.Int())
+		}
+		return true
+	})
+	return boundary
+}
+
+func claudeContentContainsSignedServerState(content gjson.Result) bool {
+	if content.IsArray() {
+		found := false
+		content.ForEach(func(_, item gjson.Result) bool {
+			found = claudeContentContainsSignedServerState(item)
+			return !found
+		})
+		return found
+	}
+	if !content.IsObject() {
+		return false
+	}
+	switch content.Get("type").String() {
+	case "server_tool_use", "advisor_tool_result", "web_search_tool_result",
+		"web_fetch_tool_result", "code_execution_tool_result",
+		"bash_code_execution_tool_result", "text_editor_code_execution_tool_result":
+		return true
+	}
+	return claudeContentContainsSignedServerState(content.Get("content"))
+}
+
 func collectForwardedClaudeSystemPromptBlocks(system gjson.Result) []string {
 	var blocks []string
 	appendText := func(text string) {

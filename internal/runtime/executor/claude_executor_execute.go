@@ -80,7 +80,8 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 		return resp, err
 	}
 	if rebuildMidSystemMessageEnabled(e.cfg, auth) {
-		body = rebuildMidSystemMessagesToTopLevel(body)
+		_, rebuildSettings := resolveClaudeWirePolicy(e.cfg, auth, apiKey, confirmedClaudeCode)
+		body = rebuildMidSystemMessagesToTopLevelPreservingSignedPrefix(body, rebuildSettings.strictMode)
 	}
 
 	// Apply cloaking (system prompt injection, fake user ID, sensitive word obfuscation)

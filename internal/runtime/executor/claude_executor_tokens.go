@@ -151,7 +151,8 @@ func (e *ClaudeExecutor) countTokensUpstream(ctx context.Context, auth *cliproxy
 		return cliproxyexecutor.Response{}, errThinking
 	}
 	if rebuildMidSystemMessageEnabled(e.cfg, auth) {
-		body = rebuildMidSystemMessagesToTopLevel(body)
+		_, rebuildSettings := resolveClaudeWirePolicy(e.cfg, auth, apiKey, confirmedClaudeCode)
+		body = rebuildMidSystemMessagesToTopLevelPreservingSignedPrefix(body, rebuildSettings.strictMode)
 	}
 
 	directAnthropic := isAnthropicUpstreamBase(baseURL)
