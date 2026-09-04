@@ -834,12 +834,8 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 								state.NextRetryAfter = next
 							}
 						case 404:
-							if disableCooling {
-								state.NextRetryAfter = time.Time{}
-							} else {
-								next := now.Add(12 * time.Hour)
-								state.NextRetryAfter = next
-							}
+							state.NextRetryAfter = notFoundRetryAfter(result.Error, modelKey, &state.Quota, now, disableCooling)
+							state.Unavailable = !state.NextRetryAfter.IsZero()
 						case 429:
 							var next time.Time
 							backoffLevel := state.Quota.BackoffLevel
@@ -917,7 +913,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 				if result.Error != nil && result.Error.Code == ErrorCodeForceCooldown {
 					disableCooling = false
 				}
-				applyAuthFailureState(auth, result.Error, result.RetryAfter, now, disableCooling)
+				applyAuthFailureState(auth, result.Error, result.RetryAfter, result.Model, now, disableCooling)
 			}
 		}
 
@@ -1981,7 +1977,51 @@ func isRequestInvalidError(err error) bool {
 	return false
 }
 
-func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Duration, now time.Time, disableCooling bool) {
+// notFoundRetryAfter decides how long a 404 should suppress the given scope.
+// Only a body that explicitly identifies requestedModel as missing earns the
+// 12h hard cooldown; requestedModel must be non-empty since the code-based
+// branch of isExplicitModelNotFoundError ignores the model entirely.
+func notFoundRetryAfter(resultErr *Error, requestedModel string, retryState *QuotaState, now time.Time, disableCooling bool) time.Time {
+	if disableCooling {
+		return time.Time{}
+	}
+	if strings.TrimSpace(requestedModel) != "" && isExplicitModelNotFoundError(resultErr, requestedModel) {
+		return now.Add(12 * time.Hour)
+	}
+	if retryState != nil && retryState.NextRecoverAt.After(now) {
+		return retryState.NextRecoverAt
+	}
+
+	baseRetryAt := nextTransientErrorRetryAfter(now)
+	if baseRetryAt.IsZero() {
+		return time.Time{}
+	}
+	backoffLevel := 0
+	if retryState != nil && retryState.BackoffLevel > 0 {
+		backoffLevel = retryState.BackoffLevel
+	}
+	cooldown := baseRetryAt.Sub(now)
+	for level := 0; level < backoffLevel && cooldown < quotaBackoffMax; level++ {
+		if cooldown > quotaBackoffMax/2 {
+			cooldown = quotaBackoffMax
+			break
+		}
+		cooldown *= 2
+	}
+	if cooldown > quotaBackoffMax {
+		cooldown = quotaBackoffMax
+	}
+	if retryState != nil && cooldown < quotaBackoffMax {
+		retryState.BackoffLevel = backoffLevel + 1
+	}
+	next := now.Add(cooldown)
+	if retryState != nil {
+		retryState.NextRecoverAt = next
+	}
+	return next
+}
+
+func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Duration, attemptedModel string, now time.Time, disableCooling bool) {
 	if auth == nil {
 		return
 	}
@@ -2042,11 +2082,22 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 		}
 	case 404:
 		auth.StatusMessage = "not_found"
-		if disableCooling {
-			auth.NextRetryAfter = time.Time{}
+		// No model was resolved onto the request; a model-not-found signal
+		// still must not cool the whole credential for 12h. Known model:
+		// pin the 12h to that model's state, credential gets short retry
+		// only. Unknown model: nothing here earns the 12h anywhere.
+		if requestedModel := strings.TrimSpace(attemptedModel); requestedModel != "" && isExplicitModelNotFoundError(resultErr, requestedModel) {
+			modelState := ensureModelState(auth, canonicalModelKey(requestedModel))
+			modelState.NextRetryAfter = now.Add(12 * time.Hour)
+			modelState.Unavailable = true
+			// Not routed through updateAggregatedAvailability: it would
+			// mirror the model's 12h back onto auth.NextRetryAfter, the
+			// leak this branch exists to avoid.
+			auth.NextRetryAfter = notFoundRetryAfter(resultErr, "", &auth.Quota, now, disableCooling)
 		} else {
-			auth.NextRetryAfter = now.Add(12 * time.Hour)
+			auth.NextRetryAfter = notFoundRetryAfter(resultErr, attemptedModel, &auth.Quota, now, disableCooling)
 		}
+		auth.Unavailable = !auth.NextRetryAfter.IsZero()
 	case 429:
 		auth.StatusMessage = "quota exhausted"
 		auth.Quota.Exceeded = true
