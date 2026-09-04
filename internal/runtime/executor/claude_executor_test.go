@@ -6513,3 +6513,139 @@ func TestClaudeExecutor_PreservesNativeAgentAndEnvironmentHeaders(t *testing.T) 
 		})
 	}
 }
+
+func TestClaudeSignedHistoryBoundaryTypes(t *testing.T) {
+	types := []string{"server_tool_use", "advisor_tool_result", "web_search_tool_result", "web_fetch_tool_result", "code_execution_tool_result", "bash_code_execution_tool_result", "text_editor_code_execution_tool_result"}
+	for _, blockType := range types {
+		payload := []byte(fmt.Sprintf(`{"messages":[{"role":"user","content":"first"},{"role":"assistant","content":[{"type":%q}]}]}`, blockType))
+		if got := claudeSignedHistoryBoundary(payload); got != 1 {
+			t.Errorf("%s boundary = %d, want 1", blockType, got)
+		}
+	}
+}
+
+func stripClaudeCacheControlForPrefixTest(raw string) string {
+	var walk func(gjson.Result) any
+	walk = func(value gjson.Result) any {
+		if value.IsArray() {
+			out := make([]any, 0, len(value.Array()))
+			for _, item := range value.Array() {
+				out = append(out, walk(item))
+			}
+			return out
+		}
+		if value.IsObject() {
+			out := map[string]any{}
+			value.ForEach(func(key, item gjson.Result) bool {
+				if key.String() != "cache_control" {
+					out[key.String()] = walk(item)
+				}
+				return true
+			})
+			return out
+		}
+		return value.Value()
+	}
+	encoded, _ := json.Marshal(walk(gjson.Parse(raw)))
+	return string(encoded)
+}
+
+func TestClaudeCloakIsDeterministicFromRawClientHistory(t *testing.T) {
+	now := time.Date(2026, 9, 3, 12, 0, 0, 0, time.UTC)
+	matcher := helps.BuildSensitiveWordMatcher([]string{"secret"})
+	rawTurn1 := []byte(`{"model":"claude-opus-5","system":"secret operator","messages":[{"role":"user","content":"s​ecret first"}]}`)
+	cloak := func(payload []byte, strict bool) []byte {
+		payload = checkSystemInstructionsWithSigningModeAt(payload, strict, true, "2.1.258", "cli", "", now)
+		return helps.ObfuscateSensitiveWords(payload, matcher)
+	}
+	for _, strict := range []bool{false, true} {
+		cloaked1 := cloak(rawTurn1, strict)
+		raw1Messages := gjson.GetBytes(rawTurn1, "messages").Array()
+		raw := []string{raw1Messages[0].Raw,
+			`{"role":"assistant","content":[{"type":"server_tool_use","name":"advisor"}]}`,
+			`{"role":"user","content":[{"type":"advisor_tool_result","content":[]}]}`,
+			`{"role":"user","content":"secret follow up"}`}
+		rawTurn2 := []byte(`{"model":"claude-opus-5","system":"secret operator","messages":[]}`)
+		rawTurn2, _ = sjson.SetRawBytes(rawTurn2, "messages", []byte("["+strings.Join(raw, ",")+"]"))
+		cloaked2 := cloak(rawTurn2, strict)
+		prefix1 := gjson.GetBytes(cloaked1, "messages").Array()
+		prefix2 := gjson.GetBytes(cloaked2, "messages").Array()
+		for i := range prefix1 {
+			got, want := stripClaudeCacheControlForPrefixTest(prefix2[i].Raw), stripClaudeCacheControlForPrefixTest(prefix1[i].Raw)
+			if got != want {
+				t.Fatalf("strict=%v message %d differs\n got %s\nwant %s", strict, i, got, want)
+			}
+		}
+		if !strings.Contains(gjson.GetBytes(cloaked1, "messages.0.content.0.text").String(), "# currentDate") || !strings.Contains(gjson.GetBytes(cloaked2, "messages.0.content.0.text").String(), "# currentDate") {
+			t.Fatalf("strict=%v date reminder missing", strict)
+		}
+		if strings.Contains(string(cloaked2), "secret") {
+			t.Fatalf("strict=%v sensitive word leaked", strict)
+		}
+		if seed := claudeBillingFingerprintMessageText(rawTurn2); seed != "secret follow up" {
+			t.Fatalf("strict=%v raw last-user seed = %q", strict, seed)
+		}
+	}
+}
+
+func TestClaudeBoundaryBoundsOnlyMidSystemRebuild(t *testing.T) {
+	payload := []byte(`{"system":"operator","messages":[{"role":"user","content":"first"},{"role":"system","content":"before"},{"role":"assistant","content":[{"type":"server_tool_use"}]},{"role":"system","content":"after"},{"role":"user","content":"last"}]}`)
+	rebuilt := rebuildMidSystemMessagesToTopLevelPreservingSignedPrefix(payload, false)
+	messages := gjson.GetBytes(rebuilt, "messages").Array()
+	if messages[1].Get("role").String() != "system" {
+		t.Fatal("pre-boundary system turn moved")
+	}
+	if messages[3].Get("role").String() != "system" || messages[3].Get("content.0.text").String() != "after" {
+		t.Fatal("post-boundary system turn did not remain canonicalized in suffix")
+	}
+}
+
+func TestClaudeExecutor_LocalCountTokensRebuildsSystemBeforeSignedBlock(t *testing.T) {
+	executor := NewClaudeExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{"rebuild_mid_system_message": "true"}}
+	payload := []byte(`{"system":"Top","messages":[{"role":"user","content":"hello"},{"role":"system","content":"Mid"},{"role":"assistant","content":[{"type":"server_tool_use","name":"advisor"}]},{"role":"user","content":[{"type":"advisor_tool_result","content":[]}]}]}`)
+	resp, err := executor.CountTokens(context.Background(), auth, cliproxyexecutor.Request{Model: "claude-sonnet-4-5", Payload: payload}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatClaude})
+	if err != nil {
+		t.Fatalf("CountTokens() error = %v", err)
+	}
+	if got := gjson.GetBytes(resp.Payload, "input_tokens").Int(); got <= 0 {
+		t.Fatalf("input_tokens = %d, want positive", got)
+	}
+}
+
+func TestClaudeBoundedRebuildCanonicalizesRetainedSystemString(t *testing.T) {
+	rawTurn1 := []byte(`{"model":"claude-opus-5","system":"top","messages":[{"role":"user","content":"first"},{"role":"system","content":"mid"}]}`)
+	turn1 := rebuildMidSystemMessagesToTopLevel(rawTurn1)
+	turn1 = checkSystemInstructionsWithSigningModeAt(turn1, false, true, "2.1.258", "cli", "", time.Date(2026, 9, 3, 12, 0, 0, 0, time.UTC))
+	want := gjson.GetBytes(turn1, "messages.2").Raw
+
+	rawTurn2 := []byte(`{"model":"claude-opus-5","system":"top","messages":[{"role":"user","content":"first"},{"role":"system","content":"mid"},{"role":"assistant","content":[{"type":"server_tool_use","name":"advisor"}]},{"role":"user","content":[{"type":"advisor_tool_result","content":[]}]},{"role":"user","content":"follow up"}]}`)
+	turn2 := rebuildMidSystemMessagesToTopLevelPreservingSignedPrefix(rawTurn2, false)
+	got := gjson.GetBytes(turn2, "messages.1").Raw
+	if got != want {
+		t.Fatalf("bounded rebuild representation differs\n got %s\nwant %s", got, want)
+	}
+	if gjson.GetBytes(turn2, "messages.1.role").String() != "system" {
+		t.Fatal("pre-boundary system turn was relocated")
+	}
+}
+
+func TestClaudeBoundedRebuildKeepsPostBoundarySystemInSuffix(t *testing.T) {
+	payload := []byte(`{"messages":[{"role":"user","content":"first"},{"role":"assistant","content":[{"type":"server_tool_use","name":"advisor"}]},{"role":"user","content":[{"type":"advisor_tool_result","content":[]}]},{"role":"system","content":"suffix rule"},{"role":"user","content":"follow up"}]}`)
+	for _, strict := range []bool{false, true} {
+		got := rebuildMidSystemMessagesToTopLevelPreservingSignedPrefix(payload, strict)
+		if gjson.GetBytes(got, "messages.1.content.0.type").String() != "server_tool_use" {
+			t.Fatalf("strict=%v signed prefix moved", strict)
+		}
+		system := gjson.GetBytes(got, `messages.#(role=="system")`)
+		if strict {
+			if system.Exists() {
+				t.Fatal("strict rebuild retained post-boundary system turn")
+			}
+		} else {
+			if !system.Exists() || system.Get("content.0.text").String() != "suffix rule" {
+				t.Fatalf("suffix system missing or misplaced: %s", gjson.GetBytes(got, "messages").Raw)
+			}
+		}
+	}
+}
