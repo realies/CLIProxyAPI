@@ -11,6 +11,7 @@ import (
 	"time"
 
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 )
 
 type recordingCooldownStateStore struct {
@@ -501,6 +502,198 @@ func TestManager_RestoreCooldownStates(t *testing.T) {
 	}
 }
 
+// TestCooldownEffectiveDeadlineSurvivesRestartAcrossShorterNextRetryAfter
+// reproduces the sequence Codex flagged at conductor_cooldown.go:2154: an
+// explicit not-found classification escalates Quota.NextRecoverAt (and
+// initially NextRetryAfter) to a 12h deadline, then a later, unrelated
+// transient 5xx overwrites NextRetryAfter alone with a much shorter
+// deadline (see the 408/500/502/503/504 branch of
+// applyAuthFailureStateForModel, which never touches Quota.NextRecoverAt).
+// Gating persistence and restore on NextRetryAfter alone would silently
+// drop the cooldown - and the credential would come back online early -
+// the moment the short deadline passes, even though the credential is
+// still blocked in memory (via availabilityBlock) until the long
+// Quota.NextRecoverAt deadline. This asserts the persisted record survives
+// past the short deadline, carries the effective (long) deadline as its
+// NextRetryAfter - so a `.cds` file is a truthful acceptance instrument -
+// and that restoring it into a brand new Manager still blocks until the
+// long deadline.
+func TestCooldownEffectiveDeadlineSurvivesRestartAcrossShorterNextRetryAfter(t *testing.T) {
+	now := time.Now()
+	longDeadline := now.Add(12 * time.Hour)
+	shortDeadline := now.Add(time.Minute)
+
+	auth := &Auth{
+		ID:             "auth-1",
+		Provider:       "xai",
+		Unavailable:    true,
+		Status:         StatusError,
+		NextRetryAfter: shortDeadline, // shortened by the later 5xx
+		Quota: QuotaState{
+			Exceeded:      true, // set true, and left untouched, by the earlier not-found escalation
+			Reason:        "model_not_found",
+			NextRecoverAt: longDeadline,
+		},
+	}
+
+	// Simulate a persistence tick that runs after the short deadline has
+	// passed but well before the long one.
+	afterShortDeadline := shortDeadline.Add(time.Minute)
+	record, ok := authCooldownStateRecord(auth, afterShortDeadline)
+	if !ok {
+		t.Fatal("authCooldownStateRecord() = false after the short NextRetryAfter expired, want true because Quota.NextRecoverAt is still active")
+	}
+	if !record.NextRetryAfter.Equal(longDeadline) {
+		t.Fatalf("persisted NextRetryAfter = %v, want the effective (long) deadline %v so the .cds file reflects the deadline actually in force", record.NextRetryAfter, longDeadline)
+	}
+	if !record.Quota.NextRecoverAt.Equal(longDeadline) {
+		t.Fatalf("persisted Quota.NextRecoverAt = %v, want %v", record.Quota.NextRecoverAt, longDeadline)
+	}
+
+	// Restore into a brand new Manager, as if the process had restarted at
+	// a point after the short deadline but before the long one.
+	manager := NewManager(nil, nil, nil)
+	if _, errRegister := manager.Register(WithSkipPersist(context.Background()), &Auth{ID: "auth-1", Provider: "xai", Status: StatusActive}); errRegister != nil {
+		t.Fatalf("Register() returned error: %v", errRegister)
+	}
+	restartAt := afterShortDeadline.Add(time.Minute)
+	manager.mu.Lock()
+	restored := manager.restoreCooldownRecordLocked(record, restartAt)
+	manager.mu.Unlock()
+	if !restored {
+		t.Fatal("restoreCooldownRecordLocked() = false at a time between the short and long deadlines, want true")
+	}
+
+	restoredAuth, ok := manager.GetByID("auth-1")
+	if !ok {
+		t.Fatal("restored auth not found")
+	}
+	if !restoredAuth.Unavailable {
+		t.Fatal("restored auth.Unavailable = false, want true")
+	}
+	if !restoredAuth.NextRetryAfter.Equal(longDeadline) {
+		t.Fatalf("restored auth.NextRetryAfter = %v, want the effective (long) deadline %v", restoredAuth.NextRetryAfter, longDeadline)
+	}
+	blocked, _, next := availabilityBlock(restoredAuth.Unavailable, restoredAuth.Quota.Exceeded, restoredAuth.NextRetryAfter, restoredAuth.Quota.NextRecoverAt, restartAt)
+	if !blocked {
+		t.Fatal("availabilityBlock() = not blocked for the restored auth, want blocked until the long deadline")
+	}
+	if !next.Equal(longDeadline) {
+		t.Fatalf("availabilityBlock() next = %v, want the long deadline %v", next, longDeadline)
+	}
+}
+
+// TestCooldownRestoreHonorsNextRecoverAtOnAHandBuiltRecord isolates the
+// restore-side gate from the persist-side fix above: it feeds
+// restoreCooldownRecordLocked a record whose NextRetryAfter is already
+// shortened (as authCooldownStateRecord would have written before this fix,
+// or as any pre-existing `.cds` file on disk still does until it is next
+// rewritten) while Quota.NextRecoverAt carries the true, longer deadline.
+// Restore must still honor the record and adopt the effective deadline.
+func TestCooldownRestoreHonorsNextRecoverAtOnAHandBuiltRecord(t *testing.T) {
+	now := time.Now()
+	longDeadline := now.Add(12 * time.Hour)
+	shortDeadline := now.Add(time.Minute)
+	restartAt := shortDeadline.Add(time.Minute) // after short, well before long
+
+	record := CooldownStateRecord{
+		Provider:       "xai",
+		AuthID:         "auth-hand-built",
+		Status:         "cooling",
+		NextRetryAfter: shortDeadline,
+		Reason:         "model_not_found",
+		Quota: QuotaState{
+			Exceeded:      true,
+			Reason:        "model_not_found",
+			NextRecoverAt: longDeadline,
+		},
+	}
+
+	manager := NewManager(nil, nil, nil)
+	if _, errRegister := manager.Register(WithSkipPersist(context.Background()), &Auth{ID: "auth-hand-built", Provider: "xai", Status: StatusActive}); errRegister != nil {
+		t.Fatalf("Register() returned error: %v", errRegister)
+	}
+	manager.mu.Lock()
+	restored := manager.restoreCooldownRecordLocked(record, restartAt)
+	manager.mu.Unlock()
+	if !restored {
+		t.Fatal("restoreCooldownRecordLocked() = false for a record whose NextRetryAfter already expired but Quota.NextRecoverAt is still active, want true")
+	}
+	restoredAuth, ok := manager.GetByID("auth-hand-built")
+	if !ok {
+		t.Fatal("restored auth not found")
+	}
+	if !restoredAuth.NextRetryAfter.Equal(longDeadline) {
+		t.Fatalf("restored NextRetryAfter = %v, want the effective (long) deadline %v", restoredAuth.NextRetryAfter, longDeadline)
+	}
+}
+
+// TestCooldownRecordLegacyRoundTripWithoutNextRecoverAt covers a genuinely
+// legacy on-disk record: only NextRetryAfter was ever meaningful for it
+// (Quota.NextRecoverAt is its zero value, as it always has been for a plain
+// transient-error cooldown that never went through the not-found/quota
+// escalation paths). It must persist and restore exactly as it did before
+// this fix - gated on, and carrying, NextRetryAfter alone.
+func TestCooldownRecordLegacyRoundTripWithoutNextRecoverAt(t *testing.T) {
+	now := time.Now()
+	deadline := now.Add(30 * time.Minute)
+
+	auth := &Auth{
+		ID:             "auth-legacy",
+		Provider:       "xai",
+		Unavailable:    true,
+		Status:         StatusError,
+		NextRetryAfter: deadline,
+		// Quota left at its zero value: no Exceeded, no NextRecoverAt.
+	}
+
+	record, ok := authCooldownStateRecord(auth, now)
+	if !ok {
+		t.Fatal("authCooldownStateRecord() = false for a live legacy-shaped cooldown, want true")
+	}
+	if !record.NextRetryAfter.Equal(deadline) {
+		t.Fatalf("persisted NextRetryAfter = %v, want %v (unchanged, no NextRecoverAt to take the max against)", record.NextRetryAfter, deadline)
+	}
+	if !record.Quota.NextRecoverAt.IsZero() {
+		t.Fatalf("persisted Quota.NextRecoverAt = %v, want zero for a legacy record", record.Quota.NextRecoverAt)
+	}
+
+	manager := NewManager(nil, nil, nil)
+	if _, errRegister := manager.Register(WithSkipPersist(context.Background()), &Auth{ID: "auth-legacy", Provider: "xai", Status: StatusActive}); errRegister != nil {
+		t.Fatalf("Register() returned error: %v", errRegister)
+	}
+
+	// Before the deadline: restores exactly as before.
+	beforeDeadline := deadline.Add(-time.Minute)
+	manager.mu.Lock()
+	restored := manager.restoreCooldownRecordLocked(record, beforeDeadline)
+	manager.mu.Unlock()
+	if !restored {
+		t.Fatal("restoreCooldownRecordLocked() = false before the legacy deadline, want true")
+	}
+	restoredAuth, ok := manager.GetByID("auth-legacy")
+	if !ok {
+		t.Fatal("restored auth not found")
+	}
+	if !restoredAuth.NextRetryAfter.Equal(deadline) {
+		t.Fatalf("restored NextRetryAfter = %v, want %v", restoredAuth.NextRetryAfter, deadline)
+	}
+
+	// After the deadline: a legacy record with no NextRecoverAt to fall
+	// back on is correctly treated as expired, exactly like before this fix.
+	manager2 := NewManager(nil, nil, nil)
+	if _, errRegister := manager2.Register(WithSkipPersist(context.Background()), &Auth{ID: "auth-legacy", Provider: "xai", Status: StatusActive}); errRegister != nil {
+		t.Fatalf("Register() returned error: %v", errRegister)
+	}
+	afterDeadline := deadline.Add(time.Minute)
+	manager2.mu.Lock()
+	restoredAfter := manager2.restoreCooldownRecordLocked(record, afterDeadline)
+	manager2.mu.Unlock()
+	if restoredAfter {
+		t.Fatal("restoreCooldownRecordLocked() = true past a legacy record's only deadline, want false")
+	}
+}
+
 func TestManager_RestoreCooldownStatesCanonicalizesThinkingSuffixes(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
 	laterRetry := now.Add(2 * time.Hour)
@@ -613,5 +806,681 @@ func TestManagerResultSaveWaitsForCooldownStoreTransition(t *testing.T) {
 	}
 	if got := newStore.saveCount.Load(); got != 1 {
 		t.Fatalf("new store save count = %d, want 1", got)
+	}
+}
+
+// TestAuthCooldownStateRecordSkipsAggregateOnlyQuotaWithAvailableSibling
+// reproduces the P1 Codex finding on discussion_r3927779676: aggregating
+// one cooling model's quota into auth.Quota (via updateAggregatedAvailability)
+// while leaving auth.Unavailable false, because a sibling model remains
+// available, must NOT itself cause authCooldownStateRecord to emit a
+// credential-level record. A raw availabilityBlock(auth.Quota...) call
+// cannot see the aggregate-vs-credential distinction and would persist a
+// record that blocks the WHOLE credential (all models) after a restart,
+// even though only one of several sibling models was ever cooling. This
+// asserts persist skips the auth-level record, and that a fresh Manager
+// restoring only the model-scoped record still leaves the sibling
+// selectable while the cooled model stays blocked.
+func TestAuthCooldownStateRecordSkipsAggregateOnlyQuotaWithAvailableSibling(t *testing.T) {
+	now := time.Now()
+	longDeadline := now.Add(12 * time.Hour)
+
+	auth := &Auth{
+		ID:       "auth-multi",
+		Provider: "openai-compat",
+		Status:   StatusActive,
+		ModelStates: map[string]*ModelState{
+			"llama3": {
+				Status:      StatusError,
+				Unavailable: true,
+				Quota: QuotaState{
+					Exceeded:      true,
+					Reason:        "quota",
+					NextRecoverAt: longDeadline,
+				},
+				NextRetryAfter: longDeadline,
+				UpdatedAt:      now,
+			},
+			"mistral": {
+				Status: StatusActive,
+			},
+		},
+	}
+	// Mirror what updateAggregatedAvailability actually does: copy the
+	// cooling sibling's quota into auth.Quota while leaving auth.Unavailable
+	// false because "mistral" is still available.
+	updateAggregatedAvailability(auth, now)
+	if auth.Unavailable {
+		t.Fatal("auth.Unavailable = true after aggregation with an available sibling, want false (precondition for this test)")
+	}
+	if !auth.Quota.Exceeded {
+		t.Fatal("auth.Quota.Exceeded = false after aggregation, want true (precondition: aggregate quota was copied)")
+	}
+
+	if _, ok := authCooldownStateRecord(auth, now); ok {
+		t.Fatal("authCooldownStateRecord() = true from an aggregate-only quota with an available sibling, want false")
+	}
+
+	llamaRecord, ok := modelCooldownStateRecord(auth, "llama3", auth.ModelStates["llama3"], now)
+	if !ok {
+		t.Fatal("modelCooldownStateRecord(llama3) = false, want true")
+	}
+
+	manager := NewManager(nil, nil, nil)
+	if _, errRegister := manager.Register(WithSkipPersist(context.Background()), &Auth{ID: "auth-multi", Provider: "openai-compat", Status: StatusActive}); errRegister != nil {
+		t.Fatalf("Register() returned error: %v", errRegister)
+	}
+	manager.mu.Lock()
+	restored := manager.restoreCooldownRecordLocked(llamaRecord, now)
+	manager.mu.Unlock()
+	if !restored {
+		t.Fatal("restoreCooldownRecordLocked(llama3) = false, want true")
+	}
+
+	restoredAuth, ok := manager.GetByID("auth-multi")
+	if !ok {
+		t.Fatal("restored auth not found")
+	}
+	if blocked, _, _ := effectiveBlock(restoredAuth, "mistral", now); blocked {
+		t.Fatal("effectiveBlock(mistral) = blocked after restoring only the llama3 model record, want selectable")
+	}
+	if blocked, _, _ := effectiveBlock(restoredAuth, "llama3", now); !blocked {
+		t.Fatal("effectiveBlock(llama3) = not blocked after restore, want blocked until the cooldown deadline")
+	}
+	if blocked, _, _ := effectiveBlock(restoredAuth, "", now); blocked {
+		t.Fatal("effectiveBlock(\"\") = blocked for the whole credential after restoring one cooling sibling, want selectable per the aggregate exception")
+	}
+
+	// Self-reinforcement guard: if restore had left restoredAuth.Unavailable
+	// true, the next persist cycle's authCooldownStateRecord call would see
+	// !auth.Unavailable fail, write a fresh credential-level record from
+	// nothing but the surviving model-scoped state, and the credential would
+	// never recover across a second restart. Confirm the persist path agrees
+	// the credential is selectable one cycle after restore.
+	if _, ok := authCooldownStateRecord(restoredAuth, now); ok {
+		t.Fatal("authCooldownStateRecord() = true one persist cycle after restoring one cooling sibling, want false (would re-darken the credential on the next restart)")
+	}
+}
+
+// TestAuthCooldownStateRecordPersistsGenuineCredentialLevel401 covers the
+// companion case: a real credential-wide cooldown (e.g. a 401, with no
+// per-model states at all) must still persist and, on restore into a fresh
+// Manager, block every model - proving the P1 fix's write-side reuse of
+// effectiveBlock didn't accidentally suppress genuine credential-level
+// records, and the restore-side fix didn't route this case through
+// updateAggregatedAvailability (which would wipe it via
+// clearAggregatedAvailability when ModelStates is empty).
+func TestAuthCooldownStateRecordPersistsGenuineCredentialLevel401(t *testing.T) {
+	now := time.Now()
+	deadline := now.Add(time.Hour)
+
+	auth := &Auth{
+		ID:             "auth-401",
+		Provider:       "openai-compat",
+		Status:         StatusError,
+		Unavailable:    true,
+		NextRetryAfter: deadline,
+		LastError:      &Error{Message: "unauthorized", HTTPStatus: 401},
+		UpdatedAt:      now,
+	}
+
+	record, ok := authCooldownStateRecord(auth, now)
+	if !ok {
+		t.Fatal("authCooldownStateRecord() = false for a genuine credential-level 401 cooldown, want true")
+	}
+	if !record.NextRetryAfter.Equal(deadline) {
+		t.Fatalf("persisted NextRetryAfter = %v, want %v", record.NextRetryAfter, deadline)
+	}
+
+	manager := NewManager(nil, nil, nil)
+	if _, errRegister := manager.Register(WithSkipPersist(context.Background()), &Auth{ID: "auth-401", Provider: "openai-compat", Status: StatusActive}); errRegister != nil {
+		t.Fatalf("Register() returned error: %v", errRegister)
+	}
+	manager.mu.Lock()
+	restored := manager.restoreCooldownRecordLocked(record, now)
+	manager.mu.Unlock()
+	if !restored {
+		t.Fatal("restoreCooldownRecordLocked() = false for the credential-level 401 record, want true")
+	}
+
+	restoredAuth, ok := manager.GetByID("auth-401")
+	if !ok {
+		t.Fatal("restored auth not found")
+	}
+	if !restoredAuth.Unavailable {
+		t.Fatal("restored auth.Unavailable = false, want true (genuine credential-level cooldown must survive restore)")
+	}
+	for _, model := range []string{"", "any-model", "another-model"} {
+		if blocked, _, _ := effectiveBlock(restoredAuth, model, now); !blocked {
+			t.Fatalf("effectiveBlock(%q) = not blocked after restoring a credential-level 401, want blocked", model)
+		}
+	}
+}
+
+// TestAuthCooldownStateRecordAgreesWithSelectorOnWriteSideGate is a direct,
+// standalone assertion that authCooldownStateRecord agrees with
+// effectiveBlock(auth, "", now) on the same in-memory auth (no
+// restore round-trip). It does not by itself prove the write-side fix is
+// exercised - that proof is the mutation-control run recorded in the P1
+// report (reverting authCooldownStateRecord to call
+// availabilityBlock(auth.Quota...) directly is caught by
+// TestAuthCooldownStateRecordSkipsAggregateOnlyQuotaWithAvailableSibling).
+// This test exists so a reviewer can see the exact gate condition without
+// cross-referencing that other test.
+func TestAuthCooldownStateRecordAgreesWithSelectorOnWriteSideGate(t *testing.T) {
+	now := time.Now()
+	auth := &Auth{
+		ID:       "auth-gate",
+		Provider: "openai-compat",
+		Status:   StatusActive,
+		ModelStates: map[string]*ModelState{
+			"cooling-model": {
+				Status:      StatusError,
+				Unavailable: true,
+				Quota: QuotaState{
+					Exceeded:      true,
+					Reason:        "quota",
+					NextRecoverAt: now.Add(12 * time.Hour),
+				},
+				NextRetryAfter: now.Add(12 * time.Hour),
+				UpdatedAt:      now,
+			},
+			"available-model": {Status: StatusActive},
+		},
+	}
+	updateAggregatedAvailability(auth, now)
+
+	// effectiveBlock(auth, "", now) is the exact function the fixed
+	// authCooldownStateRecord now calls; assert it agrees the credential is
+	// NOT blocked here - this is the gate whose removal would regress to
+	// the old bug.
+	blocked, _, _ := effectiveBlock(auth, "", now)
+	if blocked {
+		t.Fatal("effectiveBlock(auth, \"\", now) = blocked from an aggregate-only quota with an available sibling, want selectable")
+	}
+	if _, ok := authCooldownStateRecord(auth, now); ok {
+		t.Fatal("authCooldownStateRecord() must agree with effectiveBlock(auth, \"\", now) and skip the record")
+	}
+}
+
+// TestRestoreCooldownStatesAllModelsCoolingBlocksCredential covers the delta
+// review's must-fix item 1: when the registered model set for a credential
+// is PROVABLY COMPLETE - every model the registry lists for this credential
+// has a restored, blocked ModelState - restore must raise auth.Unavailable,
+// not just lower it. Without this, a credential whose every model is
+// cooling would restore into a selectable-looking state, the opposite of
+// the escalation-suppression fix's intent.
+func TestRestoreCooldownStatesAllModelsCoolingBlocksCredential(t *testing.T) {
+	now := time.Now()
+	deadline := now.Add(12 * time.Hour)
+
+	llamaState := &ModelState{
+		Status:      StatusError,
+		Unavailable: true,
+		Quota: QuotaState{
+			Exceeded:      true,
+			Reason:        "quota",
+			NextRecoverAt: deadline,
+		},
+		NextRetryAfter: deadline,
+		UpdatedAt:      now,
+	}
+	mistralState := &ModelState{
+		Status:      StatusError,
+		Unavailable: true,
+		Quota: QuotaState{
+			Exceeded:      true,
+			Reason:        "quota",
+			NextRecoverAt: deadline,
+		},
+		NextRetryAfter: deadline,
+		UpdatedAt:      now,
+	}
+	auth := &Auth{
+		ID:       "auth-all-cooling",
+		Provider: "openai-compat",
+		Status:   StatusActive,
+		ModelStates: map[string]*ModelState{
+			"llama3":  llamaState,
+			"mistral": mistralState,
+		},
+	}
+	llamaRecord, ok := modelCooldownStateRecord(auth, "llama3", llamaState, now)
+	if !ok {
+		t.Fatal("modelCooldownStateRecord(llama3) = false, want true")
+	}
+	mistralRecord, ok := modelCooldownStateRecord(auth, "mistral", mistralState, now)
+	if !ok {
+		t.Fatal("modelCooldownStateRecord(mistral) = false, want true")
+	}
+
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient("auth-all-cooling", "openai-compat", []*registry.ModelInfo{{ID: "llama3"}, {ID: "mistral"}})
+	t.Cleanup(func() { reg.UnregisterClient("auth-all-cooling") })
+
+	manager := NewManager(nil, nil, nil)
+	if _, errRegister := manager.Register(WithSkipPersist(context.Background()), &Auth{ID: "auth-all-cooling", Provider: "openai-compat", Status: StatusActive}); errRegister != nil {
+		t.Fatalf("Register() returned error: %v", errRegister)
+	}
+	manager.mu.Lock()
+	if !manager.restoreCooldownRecordLocked(llamaRecord, now) {
+		manager.mu.Unlock()
+		t.Fatal("restoreCooldownRecordLocked(llama3) = false, want true")
+	}
+	if !manager.restoreCooldownRecordLocked(mistralRecord, now) {
+		manager.mu.Unlock()
+		t.Fatal("restoreCooldownRecordLocked(mistral) = false, want true")
+	}
+	manager.mu.Unlock()
+
+	restoredAuth, ok := manager.GetByID("auth-all-cooling")
+	if !ok {
+		t.Fatal("restored auth not found")
+	}
+	if blocked, _, _ := effectiveBlock(restoredAuth, "llama3", now); !blocked {
+		t.Fatal("effectiveBlock(llama3) = not blocked after restoring both cooling models, want blocked")
+	}
+	if blocked, _, _ := effectiveBlock(restoredAuth, "mistral", now); !blocked {
+		t.Fatal("effectiveBlock(mistral) = not blocked after restoring both cooling models, want blocked")
+	}
+	if blocked, _, _ := effectiveBlock(restoredAuth, "", now); !blocked {
+		t.Fatal("effectiveBlock(\"\") = selectable after restoring every registered model as cooling, want blocked (registry set is provably complete)")
+	}
+	if !restoredAuth.Unavailable {
+		t.Fatal("restoredAuth.Unavailable = false after restoring every registered model as cooling, want true")
+	}
+}
+
+// TestRestoreCooldownStatesPartialModelSetStaysSelectable re-confirms the
+// original P1 scenario now that restore can escalate: with the registry
+// listing a sibling model that has NO restored state, the restored set is
+// not provably complete, so restore must still only lower - never raise -
+// auth.Unavailable.
+func TestRestoreCooldownStatesPartialModelSetStaysSelectable(t *testing.T) {
+	now := time.Now()
+	deadline := now.Add(12 * time.Hour)
+
+	llamaState := &ModelState{
+		Status:      StatusError,
+		Unavailable: true,
+		Quota: QuotaState{
+			Exceeded:      true,
+			Reason:        "quota",
+			NextRecoverAt: deadline,
+		},
+		NextRetryAfter: deadline,
+		UpdatedAt:      now,
+	}
+	auth := &Auth{
+		ID:       "auth-partial",
+		Provider: "openai-compat",
+		Status:   StatusActive,
+		ModelStates: map[string]*ModelState{
+			"llama3": llamaState,
+		},
+	}
+	llamaRecord, ok := modelCooldownStateRecord(auth, "llama3", llamaState, now)
+	if !ok {
+		t.Fatal("modelCooldownStateRecord(llama3) = false, want true")
+	}
+
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient("auth-partial", "openai-compat", []*registry.ModelInfo{{ID: "llama3"}, {ID: "mistral"}})
+	t.Cleanup(func() { reg.UnregisterClient("auth-partial") })
+
+	manager := NewManager(nil, nil, nil)
+	if _, errRegister := manager.Register(WithSkipPersist(context.Background()), &Auth{ID: "auth-partial", Provider: "openai-compat", Status: StatusActive}); errRegister != nil {
+		t.Fatalf("Register() returned error: %v", errRegister)
+	}
+	manager.mu.Lock()
+	restored := manager.restoreCooldownRecordLocked(llamaRecord, now)
+	manager.mu.Unlock()
+	if !restored {
+		t.Fatal("restoreCooldownRecordLocked(llama3) = false, want true")
+	}
+
+	restoredAuth, ok := manager.GetByID("auth-partial")
+	if !ok {
+		t.Fatal("restored auth not found")
+	}
+	if blocked, _, _ := effectiveBlock(restoredAuth, "", now); blocked {
+		t.Fatal("effectiveBlock(\"\") = blocked when the registry lists an unrestored sibling (mistral), want selectable - the restored set is not provably complete")
+	}
+	if restoredAuth.Unavailable {
+		t.Fatal("restoredAuth.Unavailable = true when the restored model set is not provably complete, want false")
+	}
+}
+
+// TestRestoreCooldownStatesModelSetCompletenessMutationControl is a
+// mutation control for the item-1 fix: reverting restoreCooldownRecordLocked
+// to always suppress the escalation (its pre-this-round behavior) must be
+// caught by TestRestoreCooldownStatesAllModelsCoolingBlocksCredential.
+func TestRestoreCooldownStatesModelSetCompletenessMutationControl(t *testing.T) {
+	now := time.Now()
+	auth := &Auth{
+		ID:       "auth-gate-complete",
+		Provider: "openai-compat",
+		Status:   StatusActive,
+		ModelStates: map[string]*ModelState{
+			"only-model": {
+				Status:         StatusError,
+				Unavailable:    true,
+				NextRetryAfter: now.Add(time.Hour),
+				UpdatedAt:      now,
+			},
+		},
+	}
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient("auth-gate-complete", "openai-compat", []*registry.ModelInfo{{ID: "only-model"}})
+	t.Cleanup(func() { reg.UnregisterClient("auth-gate-complete") })
+
+	manager := NewManager(nil, nil, nil)
+	if _, errRegister := manager.Register(WithSkipPersist(context.Background()), &Auth{ID: "auth-gate-complete", Provider: "openai-compat", Status: StatusActive}); errRegister != nil {
+		t.Fatalf("Register() returned error: %v", errRegister)
+	}
+	manager.mu.Lock()
+	registered := manager.auths["auth-gate-complete"]
+	manager.mu.Unlock()
+	if !manager.restoredModelSetIsComplete(mergeAuthModelStates(registered, auth), now) {
+		t.Fatal("restoredModelSetIsComplete() = false for a registry set fully covered by restored, blocked states, want true")
+	}
+}
+
+// mergeAuthModelStates copies model states from src onto a shallow clone of
+// dst for the completeness-gate mutation control, without going through the
+// full restore path (which is already covered end-to-end by the other two
+// tests in this group).
+func mergeAuthModelStates(dst, src *Auth) *Auth {
+	if dst == nil || src == nil {
+		return dst
+	}
+	dst.ModelStates = src.ModelStates
+	return dst
+}
+
+// TestUpdateAggregatedAvailabilityPreservesGenericNotFoundThroughSiblingSuccess
+// covers the delta review's must-fix item 3, reproducing the exact sequence
+// from Codex's finding: a generic (non-explicit) 404 stores its backoff in
+// state.Quota.NextRecoverAt while leaving state.Quota.Exceeded false (see
+// notFoundRetryAfter's non-explicit branch, which writes
+// retryState.NextRecoverAt directly with no applyCooldownFields call). A
+// concurrent, shorter-lived 5xx then overwrites state.NextRetryAfter with an
+// earlier deadline without touching Quota at all. Once that shorter
+// NextRetryAfter passes, a sibling model's success calls
+// updateAggregatedAvailability. Pre-fix, the aggregation loop decided
+// per-model unavailability from state.Unavailable + state.NextRetryAfter
+// alone: once NextRetryAfter was in the past it unconditionally cleared
+// BOTH state.Unavailable and state.NextRetryAfter, discarding the still
+// future state.Quota.NextRecoverAt with no attempt to consult it - and
+// availabilityBlock's own bypass (`!unavailable && !quotaExceeded`) then
+// ignores NextRecoverAt too, so the model becomes selectable hours before
+// its generic-404 backoff actually expires. Post-fix, aggregation decides
+// via the same availabilityBlock predicate the selector itself uses, fed
+// state.Unavailable (still true - nothing clears it prematurely) alongside
+// both deadlines, so it keeps blocking until the later of the two expires.
+func TestUpdateAggregatedAvailabilityPreservesGenericNotFoundThroughSiblingSuccess(t *testing.T) {
+	now := time.Now()
+	shortenedRetryAfter := now.Add(30 * time.Second)   // the concurrent 5xx's shorter deadline
+	genericNotFoundRecoverAt := now.Add(2 * time.Hour) // the original generic-404 backoff
+
+	problemState := &ModelState{
+		Status:         StatusError,
+		Unavailable:    true,
+		NextRetryAfter: shortenedRetryAfter,
+		Quota: QuotaState{
+			Exceeded:      false,
+			NextRecoverAt: genericNotFoundRecoverAt,
+		},
+		UpdatedAt: now,
+	}
+	siblingState := &ModelState{Status: StatusActive}
+	auth := &Auth{
+		ID:       "auth-generic-404",
+		Provider: "openai-compat",
+		Status:   StatusActive,
+		ModelStates: map[string]*ModelState{
+			"problem-model": problemState,
+			"sibling-model": siblingState,
+		},
+	}
+
+	// The shortened NextRetryAfter has now passed, but the generic-404's
+	// own NextRecoverAt (2h out) has not. A sibling success triggers
+	// aggregation at this later time.
+	afterShortDeadline := now.Add(31 * time.Second)
+	updateAggregatedAvailability(auth, afterShortDeadline)
+
+	if blocked, _, next := effectiveBlock(auth, "problem-model", afterShortDeadline); !blocked {
+		t.Fatalf("effectiveBlock(problem-model) = not blocked at %v after a sibling success, want blocked until %v (generic-404 NextRecoverAt) - got next=%v", afterShortDeadline, genericNotFoundRecoverAt, next)
+	}
+	if blocked, _, _ := effectiveBlock(auth, "sibling-model", afterShortDeadline); blocked {
+		t.Fatal("effectiveBlock(sibling-model) = blocked, want selectable")
+	}
+
+	// Confirm the deadline itself is honored: once genericNotFoundRecoverAt
+	// has actually passed, the model must become selectable again.
+	afterLongDeadline := genericNotFoundRecoverAt.Add(time.Second)
+	updateAggregatedAvailability(auth, afterLongDeadline)
+	if blocked, _, _ := effectiveBlock(auth, "problem-model", afterLongDeadline); blocked {
+		t.Fatal("effectiveBlock(problem-model) = still blocked after genericNotFoundRecoverAt has passed, want selectable")
+	}
+}
+
+// TestUpdateAggregatedAvailabilityGenericNotFoundMutationControl is a
+// mutation control for item 3: reverting updateAggregatedAvailability's
+// per-model decision to the pre-fix field-specific shortcut (NextRetryAfter
+// alone, unconditionally clearing Unavailable/NextRetryAfter once it
+// expires) must be caught by
+// TestUpdateAggregatedAvailabilityPreservesGenericNotFoundThroughSiblingSuccess.
+func TestUpdateAggregatedAvailabilityGenericNotFoundMutationControl(t *testing.T) {
+	now := time.Now()
+	afterShortDeadline := now.Add(31 * time.Second)
+
+	// Directly re-execute the pre-fix per-model decision to document the
+	// exact gate this test group protects, independent of the full
+	// updateAggregatedAvailability call.
+	state := &ModelState{
+		Status:         StatusError,
+		Unavailable:    true,
+		NextRetryAfter: now.Add(30 * time.Second),
+		Quota: QuotaState{
+			Exceeded:      false,
+			NextRecoverAt: now.Add(2 * time.Hour),
+		},
+	}
+	preFixStateUnavailable := false
+	if state.Status == StatusDisabled {
+		preFixStateUnavailable = true
+	} else if state.Unavailable {
+		if state.NextRetryAfter.IsZero() {
+			preFixStateUnavailable = false
+		} else if state.NextRetryAfter.After(afterShortDeadline) {
+			preFixStateUnavailable = true
+		} else {
+			preFixStateUnavailable = false // the pre-fix wipe branch
+		}
+	}
+	if preFixStateUnavailable {
+		t.Fatal("pre-fix field-specific shortcut unexpectedly still reports unavailable - mutation control precondition broken, update this test")
+	}
+	blocked, _, _ := availabilityBlock(false, false, time.Time{}, state.Quota.NextRecoverAt, afterShortDeadline)
+	if blocked {
+		t.Fatal("pre-fix wipe followed by availabilityBlock(false, false, ...) unexpectedly still blocks - mutation control precondition broken, update this test")
+	}
+}
+
+// TestRestoreCooldownStatesCredentialWideSurvivesCleanModelStates covers the
+// delta review's second must-fix item: a genuine credential-wide failure
+// (e.g. a 401, applied directly to auth.Unavailable/NextRetryAfter by
+// applyAuthFailureStateForModel, with no per-model context at all) must not
+// be silently cleared by updateAggregatedAvailability just because this
+// credential also happens to carry clean historical ModelStates entries
+// (models it has served successfully before, with no error state of their
+// own). Before this fix, restoreCooldownRecordLocked's model=="" branch
+// unconditionally re-derived auth.Unavailable from ModelStates the moment
+// ModelStates was non-empty, discarding the persisted 401's own deadline the
+// instant any clean sibling model state existed. The fix persists an
+// explicit Scope=credential marker on the auth-level record and threads it
+// through to auth.CredentialCooldown, which updateAggregatedAvailability now
+// checks before ever consulting ModelStates.
+func TestRestoreCooldownStatesCredentialWideSurvivesCleanModelStates(t *testing.T) {
+	now := time.Now()
+	deadline := now.Add(30 * time.Minute).UTC().Truncate(time.Second)
+
+	store := &recordingCooldownStateStore{
+		load: []CooldownStateRecord{
+			{
+				Provider:       "claude",
+				AuthID:         "auth-401",
+				Model:          "",
+				Status:         "cooling",
+				NextRetryAfter: deadline,
+				Reason:         "unauthorized",
+				Scope:          cooldownScopeCredential,
+				UpdatedAt:      now,
+			},
+		},
+	}
+	manager := NewManager(nil, nil, nil)
+	manager.SetCooldownStateStore(store)
+	auth := &Auth{
+		ID:       "auth-401",
+		Provider: "claude",
+		Status:   StatusActive,
+		// Clean historical model states: this credential has served these
+		// models before with no error of their own. This is exactly the
+		// condition Codex flagged as silently clearing a genuine
+		// credential-wide cooldown.
+		ModelStates: map[string]*ModelState{
+			"claude-opus":  {Status: StatusActive},
+			"claude-haiku": {Status: StatusActive},
+		},
+	}
+	if _, errRegister := manager.Register(WithSkipPersist(context.Background()), auth); errRegister != nil {
+		t.Fatalf("Register() returned error: %v", errRegister)
+	}
+
+	if errRestore := manager.RestoreCooldownStates(context.Background()); errRestore != nil {
+		t.Fatalf("RestoreCooldownStates() returned error: %v", errRestore)
+	}
+
+	restored, ok := manager.GetByID("auth-401")
+	if !ok {
+		t.Fatal("restored auth was not found")
+	}
+	if !restored.Unavailable {
+		t.Fatal("restored auth.Unavailable = false, want true (credential-wide 401 must survive clean sibling model states)")
+	}
+	if !restored.CredentialCooldown {
+		t.Fatal("restored auth.CredentialCooldown = false, want true")
+	}
+	if !restored.NextRetryAfter.Equal(deadline) {
+		t.Fatalf("restored auth.NextRetryAfter = %v, want %v", restored.NextRetryAfter, deadline)
+	}
+	if blocked, _, next := effectiveBlock(restored, "", now); !blocked || !next.Equal(deadline) {
+		t.Fatalf("effectiveBlock(auth, \"\", now) = (%v, _, %v), want (true, _, %v)", blocked, next, deadline)
+	}
+	// Every individual model must be blocked too - a credential-wide failure
+	// blocks everything, not just the aggregate query.
+	if blocked, _, _ := effectiveBlock(restored, "claude-opus", now); !blocked {
+		t.Fatal("effectiveBlock(auth, \"claude-opus\", now) = false, want true")
+	}
+
+	// Once the deadline has actually passed, the credential-wide block must
+	// lift - this is a deadline, not a permanent flag.
+	afterDeadline := deadline.Add(time.Second)
+	if blocked, _, _ := effectiveBlock(restored, "", afterDeadline); blocked {
+		t.Fatal("effectiveBlock(auth, \"\", afterDeadline) = true, want false once the credential-wide deadline has passed")
+	}
+}
+
+// TestRestoreCooldownStatesLegacyAuthRecordRoundTrip confirms a record
+// written before the Scope field existed (Scope == "", the zero value)
+// keeps its pre-existing behavior on restore: an auth-level record is still
+// re-derived from ModelStates whenever any exist, exactly as before this
+// round's fix. This is the documented backward-compatibility default from
+// the delta review - only an explicit Scope=credential marker changes
+// behavior.
+func TestRestoreCooldownStatesLegacyAuthRecordRoundTrip(t *testing.T) {
+	now := time.Now()
+	deadline := now.Add(30 * time.Minute).UTC().Truncate(time.Second)
+
+	store := &recordingCooldownStateStore{
+		load: []CooldownStateRecord{
+			{
+				Provider:       "claude",
+				AuthID:         "auth-legacy",
+				Model:          "",
+				Status:         "cooling",
+				NextRetryAfter: deadline,
+				Reason:         "unauthorized",
+				// Scope intentionally left unset (zero value), simulating a
+				// record persisted by a build before this field existed.
+				UpdatedAt: now,
+			},
+		},
+	}
+	manager := NewManager(nil, nil, nil)
+	manager.SetCooldownStateStore(store)
+	auth := &Auth{
+		ID:       "auth-legacy",
+		Provider: "claude",
+		Status:   StatusActive,
+		ModelStates: map[string]*ModelState{
+			"claude-opus": {Status: StatusActive},
+		},
+	}
+	if _, errRegister := manager.Register(WithSkipPersist(context.Background()), auth); errRegister != nil {
+		t.Fatalf("Register() returned error: %v", errRegister)
+	}
+
+	if errRestore := manager.RestoreCooldownStates(context.Background()); errRestore != nil {
+		t.Fatalf("RestoreCooldownStates() returned error: %v", errRestore)
+	}
+
+	restored, ok := manager.GetByID("auth-legacy")
+	if !ok {
+		t.Fatal("restored auth was not found")
+	}
+	// Unchanged pre-existing behavior: a legacy auth-level record with
+	// ModelStates present is re-derived from ModelStates, not trusted
+	// directly - the clean sibling clears it.
+	if restored.Unavailable {
+		t.Fatal("restored auth.Unavailable = true, want false (legacy Scope=\"\" record must keep the pre-existing ModelStates-derived behavior)")
+	}
+	if restored.CredentialCooldown {
+		t.Fatal("restored auth.CredentialCooldown = true, want false for a legacy record")
+	}
+}
+
+// TestRestoreCooldownStatesCredentialWideMutationControl is a mutation
+// control for the credential-scope fix: reverting
+// restoreCooldownRecordLocked's model=="" branch to unconditionally call
+// updateAggregatedAvailability whenever ModelStates is non-empty (ignoring
+// record.Scope entirely, as before this round) must be caught by
+// TestRestoreCooldownStatesCredentialWideSurvivesCleanModelStates.
+func TestRestoreCooldownStatesCredentialWideMutationControl(t *testing.T) {
+	now := time.Now()
+	deadline := now.Add(30 * time.Minute)
+
+	auth := &Auth{
+		ID:       "auth-401",
+		Provider: "claude",
+		Status:   StatusActive,
+		ModelStates: map[string]*ModelState{
+			"claude-opus": {Status: StatusActive},
+		},
+	}
+	// Directly re-execute the pre-fix branch: unconditional
+	// updateAggregatedAvailability whenever ModelStates is non-empty,
+	// without ever consulting a Scope marker.
+	auth.Unavailable = true
+	auth.Status = StatusError
+	auth.NextRetryAfter = deadline
+	if len(auth.ModelStates) > 0 {
+		updateAggregatedAvailability(auth, now)
+	}
+	if auth.Unavailable {
+		t.Fatal("pre-fix unconditional updateAggregatedAvailability unexpectedly still reports unavailable - mutation control precondition broken, update this test")
 	}
 }

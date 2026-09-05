@@ -228,6 +228,14 @@ func ResponseFormatOrSource(opts Options) sdktranslator.Format {
 	return opts.SourceFormat
 }
 
+// WireModelMetadataKey is the Response.Metadata key an executor sets to the
+// exact model string it placed on the outbound upstream request, once known
+// (before or after the call completes). Executors that normalize the model
+// internally (stripping a thinking suffix, remapping an alias) should
+// populate this so callers can classify upstream errors against the model
+// the provider actually saw, instead of the pre-normalization request model.
+const WireModelMetadataKey = "wire_model"
+
 // Response wraps either a full provider response or metadata for streaming flows.
 type Response struct {
 	// Payload is the provider response in the executor format.
@@ -253,6 +261,16 @@ type StreamResult struct {
 	Headers http.Header
 	// Chunks is the channel of streaming payload units.
 	Chunks <-chan StreamChunk
+	// Metadata exposes optional structured data about the stream, captured
+	// before streaming begins. Executors that normalize the model internally
+	// on a streaming request (stripping a thinking suffix, remapping an
+	// alias) should set Metadata[WireModelMetadataKey] to the exact model
+	// placed on the outbound upstream request, mirroring Response.Metadata's
+	// contract on the non-streaming path, so a successful stream's recorded
+	// Result.UpstreamModel - and any mid-stream structured 404 without its
+	// own WireModel() - can be classified against the wire model instead of
+	// the pre-normalization request model.
+	Metadata map[string]any
 }
 
 // StatusError represents an error that carries an HTTP-like status code.

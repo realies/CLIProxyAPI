@@ -216,6 +216,45 @@ func (m *Manager) updateInternal(ctx context.Context, base, auth *Auth, mode upd
 				auth.Status = existing.Status
 			}
 		}
+		// A refreshed/clean Auth (e.g. after a routine access-token refresh)
+		// must not erase a live credential-wide cooldown (e.g. a 401) - the
+		// incoming Auth carries no cooldown context of its own, so without
+		// this the update would silently clear an active block before its
+		// deadline just because the new value looks clean. But this must
+		// NOT apply when the incoming Auth is a genuinely different
+		// credential (an operator re-login writing a new refresh/access
+		// token to the same auth file/ID) - the dead-grant recovery
+		// playbook depends on a re-login restoring service immediately,
+		// not leaving it blocked until the old credential's deadline.
+		//
+		// The liveness check uses genuineCredentialDeadline rather than
+		// existing.NextRetryAfter alone (2026-09-04 review, finding 2):
+		// checking NextRetryAfter alone missed a case where
+		// CredentialCooldown was true, NextRetryAfter had independently
+		// expired, but existing.Quota.NextRecoverAt (Reason ==
+		// "credential_quota") was still live - genuineCredentialDeadline
+		// takes the max of both so neither field's expiry alone drops the
+		// other. The unconditional Quota-preserving block above already
+		// covers the credential_quota-only case (including a re-login,
+		// deliberately, so a rotated credential still honours a live
+		// quota-wide block); this block additionally covers
+		// CredentialCooldown's own scope and applies the re-login override.
+		updateNow := time.Now()
+		if existing.CredentialCooldown && genuineCredentialDeadline(existing, updateNow).After(updateNow) {
+			if sameAuthCredential(existing, auth) {
+				auth.Unavailable = existing.Unavailable
+				auth.NextRetryAfter = existing.NextRetryAfter
+				auth.CredentialCooldown = existing.CredentialCooldown
+				if auth.Status == StatusActive {
+					auth.Status = existing.Status
+				}
+			} else {
+				auth.Unavailable = false
+				auth.NextRetryAfter = time.Time{}
+				auth.CredentialCooldown = false
+				auth.Status = StatusActive
+			}
+		}
 	}
 	now := time.Now()
 	auth.UpdatedAt = now

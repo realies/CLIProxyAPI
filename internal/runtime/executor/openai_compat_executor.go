@@ -142,6 +142,7 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 		translated = sanitizeOpenAIResponsesReasoningEncryptedContent(ctx, "openai compat executor", translated)
 	}
 	reporter.SetTranslatedReasoningEffort(translated, to.String())
+	resp.Metadata = map[string]any{cliproxyexecutor.WireModelMetadataKey: finalWireModel(translated, baseModel)}
 
 	url := strings.TrimSuffix(baseURL, "/") + endpoint
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(translated))
@@ -193,7 +194,7 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 		b, _ := io.ReadAll(httpResp.Body)
 		helps.AppendAPIResponseChunk(ctx, e.cfg, b)
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
-		err = newOpenAICompatStatusError(httpResp.StatusCode, httpResp.Header, b)
+		err = withWireModelIfNotFound(newOpenAICompatStatusError(httpResp.StatusCode, httpResp.Header, b), httpResp.StatusCode, finalWireModel(translated, baseModel))
 		return resp, err
 	}
 	body, err := io.ReadAll(httpResp.Body)
@@ -211,7 +212,7 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 	if responseFormat == sdktranslator.FormatOpenAIResponse {
 		out = helps.EnsureResponsesUsageDetails(out)
 	}
-	resp = cliproxyexecutor.Response{Payload: out, Headers: httpResp.Header.Clone()}
+	resp = cliproxyexecutor.Response{Payload: out, Headers: httpResp.Header.Clone(), Metadata: map[string]any{cliproxyexecutor.WireModelMetadataKey: finalWireModel(translated, baseModel)}}
 	return resp, nil
 }
 
@@ -294,13 +295,13 @@ func (e *OpenAICompatExecutor) executeImages(ctx context.Context, auth *cliproxy
 
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), body))
-		err = newOpenAICompatStatusError(httpResp.StatusCode, httpResp.Header, body)
+		err = withWireModelIfNotFound(newOpenAICompatStatusError(httpResp.StatusCode, httpResp.Header, body), httpResp.StatusCode, finalWireModel(payload, baseModel))
 		return resp, err
 	}
 
 	reporter.Publish(ctx, helps.ParseOpenAIUsage(body))
 	reporter.EnsurePublished(ctx)
-	resp = cliproxyexecutor.Response{Payload: body, Headers: httpResp.Header.Clone()}
+	resp = cliproxyexecutor.Response{Payload: body, Headers: httpResp.Header.Clone(), Metadata: map[string]any{cliproxyexecutor.WireModelMetadataKey: finalWireModel(payload, baseModel)}}
 	return resp, nil
 }
 
@@ -405,7 +406,7 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 		if errClose := httpResp.Body.Close(); errClose != nil {
 			log.Errorf("openai compat executor: close response body error: %v", errClose)
 		}
-		err = newOpenAICompatStatusError(httpResp.StatusCode, httpResp.Header, b)
+		err = withWireModelIfNotFound(newOpenAICompatStatusError(httpResp.StatusCode, httpResp.Header, b), httpResp.StatusCode, finalWireModel(translated, baseModel))
 		return nil, err
 	}
 	out := make(chan cliproxyexecutor.StreamChunk)
@@ -435,8 +436,13 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 			}
 			helps.RecordAPIResponseError(ctx, e.cfg, loggedErr)
 			reporter.PublishFailure(ctx, loggedErr)
+			// A structured error arriving mid-stream (after a 200) still needs the
+			// wire model attached when it is a 404, so a not-found classification
+			// after the SSE has started reads the same as one caught on the
+			// initial response status check.
+			chunkErr := withWireModelIfNotFound(error(streamErr), streamErr.code, finalWireModel(translated, baseModel))
 			select {
-			case out <- cliproxyexecutor.StreamChunk{Err: streamErr}:
+			case out <- cliproxyexecutor.StreamChunk{Err: chunkErr}:
 			case <-ctx.Done():
 			}
 			streamFailed = true
@@ -567,7 +573,11 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 		streamUsage.Publish(ctx, reporter)
 		reporter.EnsurePublished(ctx)
 	}()
-	return &cliproxyexecutor.StreamResult{Headers: httpResp.Header.Clone(), Chunks: out}, nil
+	return &cliproxyexecutor.StreamResult{
+		Headers:  httpResp.Header.Clone(),
+		Chunks:   out,
+		Metadata: map[string]any{cliproxyexecutor.WireModelMetadataKey: finalWireModel(translated, baseModel)},
+	}, nil
 }
 
 func (e *OpenAICompatExecutor) executeImagesStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, endpointPath string) (_ *cliproxyexecutor.StreamResult, err error) {
@@ -647,7 +657,7 @@ func (e *OpenAICompatExecutor) executeImagesStream(ctx context.Context, auth *cl
 		}
 		helps.AppendAPIResponseChunk(ctx, e.cfg, body)
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), body))
-		return nil, statusErr{code: httpResp.StatusCode, msg: string(body)}
+		return nil, withWireModelIfNotFound(statusErr{code: httpResp.StatusCode, msg: string(body)}, httpResp.StatusCode, finalWireModel(payload, baseModel))
 	}
 
 	out := make(chan cliproxyexecutor.StreamChunk)
@@ -684,7 +694,11 @@ func (e *OpenAICompatExecutor) executeImagesStream(ctx context.Context, auth *cl
 			}
 		}
 	}()
-	return &cliproxyexecutor.StreamResult{Headers: httpResp.Header.Clone(), Chunks: out}, nil
+	return &cliproxyexecutor.StreamResult{
+		Headers:  httpResp.Header.Clone(),
+		Chunks:   out,
+		Metadata: map[string]any{cliproxyexecutor.WireModelMetadataKey: finalWireModel(payload, baseModel)},
+	}, nil
 }
 
 func (e *OpenAICompatExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
@@ -1065,4 +1079,72 @@ func openAICompatRetryAfter(status int, headers http.Header, body []byte, now ti
 		return &delay
 	}
 	return nil
+}
+
+// wireModelErr decorates an error with the exact model an executor placed on
+// the outbound upstream request. Execute/CountTokens report this via
+// Response.Metadata (see cliproxyexecutor.WireModelMetadataKey), but
+// ExecuteStream returns no Response on failure, so this is the only channel
+// available for a structured stream-path error to carry the wire model back
+// to the conductor for classification.
+type wireModelErr struct {
+	error
+	model string
+}
+
+func (e wireModelErr) WireModel() string { return e.model }
+func (e wireModelErr) Unwrap() error     { return e.error }
+
+// StatusCode/RetryAfter forward to the wrapped error when present, so code
+// that type-asserts these interfaces directly (rather than via errors.As)
+// keeps working unchanged through the wrapper.
+func (e wireModelErr) StatusCode() int {
+	type statusCoder interface{ StatusCode() int }
+	if sc, ok := e.error.(statusCoder); ok {
+		return sc.StatusCode()
+	}
+	return 0
+}
+func (e wireModelErr) RetryAfter() *time.Duration {
+	type retryAfterProvider interface{ RetryAfter() *time.Duration }
+	if rap, ok := e.error.(retryAfterProvider); ok {
+		return rap.RetryAfter()
+	}
+	return nil
+}
+
+// withWireModel wraps err with the wire model an executor placed on the
+// outbound request, if err is non-nil and model is non-empty. Wrapping
+// preserves StatusCode()/RetryAfter()/etc. via Unwrap, so callers using
+// errors.As for those still find them.
+func withWireModel(err error, model string) error {
+	if err == nil || model == "" {
+		return err
+	}
+	return wireModelErr{error: err, model: model}
+}
+
+// withWireModelIfNotFound wraps err with the wire model only when statusCode
+// is 404. Only the not-found classification (explicit-model vs
+// endpoint-neutral) depends on knowing the model actually sent; every other
+// status code must keep returning the exact statusErr value origin/dev
+// returns, since callers elsewhere type-assert on that concrete type
+// directly rather than via errors.As.
+func withWireModelIfNotFound(err error, statusCode int, model string) error {
+	if statusCode != http.StatusNotFound {
+		return err
+	}
+	return withWireModel(err, model)
+}
+
+// finalWireModel reads the model actually present in the finished outbound
+// payload, falling back when the field is absent or empty. Payload rules
+// (ApplyPayloadConfigWithRequest/Tracked) can rewrite the top-level model
+// long after the pre-call normalization that computes upstreamModel, so only
+// a read of the body about to be sent describes what the provider will see.
+func finalWireModel(body []byte, fallback string) string {
+	if v := strings.TrimSpace(gjson.GetBytes(body, "model").String()); v != "" {
+		return v
+	}
+	return fallback
 }

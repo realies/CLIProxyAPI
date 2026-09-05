@@ -127,6 +127,7 @@ func (e *KimiExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 
 	// Strip kimi- prefix and any [1m] suffix for upstream API
 	upstreamModel := normalizeKimiUpstreamModel(baseModel)
+	resp.Metadata = map[string]any{cliproxyexecutor.WireModelMetadataKey: upstreamModel}
 	body, err = sjson.SetBytes(body, "model", upstreamModel)
 	if err != nil {
 		return resp, fmt.Errorf("kimi executor: failed to set model in payload: %w", err)
@@ -146,6 +147,10 @@ func (e *KimiExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 	}
 	body = normalizeKimiTools(body)
 	reporter.SetTranslatedReasoningEffort(body, e.Identifier())
+	// Payload rules (ApplyPayloadConfigWithRequest) can rewrite model long
+	// after upstreamModel was computed, so re-derive the wire model from the
+	// finished body about to be sent.
+	resp.Metadata = map[string]any{cliproxyexecutor.WireModelMetadataKey: finalWireModel(body, upstreamModel)}
 
 	url := kimiauth.KimiAPIBaseURL + "/v1/chat/completions"
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
@@ -271,6 +276,10 @@ func (e *KimiExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 	}
 	body = normalizeKimiTools(body)
 	reporter.SetTranslatedReasoningEffort(body, e.Identifier())
+	// Payload rules (ApplyPayloadConfigWithRequest) can rewrite model long
+	// after upstreamModel was computed, so re-derive the wire model from the
+	// finished body about to be sent.
+	wireModel := finalWireModel(body, upstreamModel)
 
 	url := kimiauth.KimiAPIBaseURL + "/v1/chat/completions"
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
@@ -316,7 +325,7 @@ func (e *KimiExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 		if errClose := httpResp.Body.Close(); errClose != nil {
 			log.Errorf("kimi executor: close response body error: %v", errClose)
 		}
-		err = statusErr{code: httpResp.StatusCode, msg: string(b)}
+		err = withWireModel(statusErr{code: httpResp.StatusCode, msg: string(b)}, wireModel)
 		return nil, err
 	}
 	out := make(chan cliproxyexecutor.StreamChunk)
@@ -363,7 +372,11 @@ func (e *KimiExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 			}
 		}
 	}()
-	return &cliproxyexecutor.StreamResult{Headers: httpResp.Header.Clone(), Chunks: out}, nil
+	return &cliproxyexecutor.StreamResult{
+		Headers:  httpResp.Header.Clone(),
+		Chunks:   out,
+		Metadata: map[string]any{cliproxyexecutor.WireModelMetadataKey: wireModel},
+	}, nil
 }
 
 // CountTokens estimates token count for Kimi requests.

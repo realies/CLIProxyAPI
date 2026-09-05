@@ -471,7 +471,7 @@ func collectAvailableByPriority(auths []*Auth, model string, now time.Time) (ava
 	available = make(map[int][]*Auth)
 	for i := 0; i < len(auths); i++ {
 		candidate := auths[i]
-		blocked, reason, next := isAuthBlockedForModel(candidate, model, now)
+		blocked, reason, next := effectiveBlock(candidate, model, now)
 		if !blocked {
 			priority := authPriority(candidate)
 			available[priority] = append(available[priority], candidate)
@@ -795,22 +795,54 @@ func (s *FillFirstSelector) Pick(ctx context.Context, provider, model string, op
 	return available[0], nil
 }
 
-func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, blockReason, time.Time) {
+// effectiveBlock reports whether auth is currently blocked for modelKey (or
+// at the credential level alone when modelKey is ""), and if so, the
+// reason and the deadline it clears at. It subsumes the former
+// effectiveBlock; every former caller of that name now calls this
+// one - see selector.go's laterFutureDeadline/effectiveDeadline for the
+// shared deadline arithmetic this and availabilityBlock both build on.
+func effectiveBlock(auth *Auth, modelKey string, now time.Time) (bool, blockReason, time.Time) {
 	if auth == nil {
 		return true, blockReasonOther, time.Time{}
 	}
 	if auth.Disabled || auth.Status == StatusDisabled {
 		return true, blockReasonDisabled, time.Time{}
 	}
+	// Exception, documented in the PR body: token expiry is not a cooldown
+	// deadline field covered by effectiveDeadline - it is a hard cutoff
+	// independent of any NextRetryAfter/NextRecoverAt value, so it is left
+	// as a direct read here rather than folded into that accessor.
 	if exp, ok := auth.AccessTokenExpirationTime(); ok && !exp.IsZero() && !exp.After(now) {
 		return true, blockReasonOther, time.Time{}
 	}
-	if auth.Quota.Exceeded && auth.Quota.Reason == "credential_quota" && auth.Quota.NextRecoverAt.After(now) {
-		return true, blockReasonCooldown, auth.Quota.NextRecoverAt
+	// A genuine credential-wide cooldown (either a credential_quota window
+	// or a CredentialCooldown-marked failure, e.g. a 401) blocks every
+	// model regardless of any individual model's own ModelStates entry - a
+	// clean per-model state does not mean the credential itself is usable.
+	// Both conditions resolve to the same blockReasonCooldown, so they
+	// share one effectiveDeadline(auth, "", now) call for the deadline
+	// arithmetic instead of two independent field reads.
+	credQuotaLive := auth.Quota.Exceeded && auth.Quota.Reason == "credential_quota"
+	credCooldownLive := auth.CredentialCooldown && auth.Unavailable
+	if credQuotaLive || credCooldownLive {
+		// Route through availabilityBlock, the same primitive the per-model
+		// loop and fallback below use, rather than returning a bespoke
+		// tuple here - effectiveBlock is built ON availabilityBlock, not
+		// beside it. effectiveDeadline supplies the combined deadline
+		// (credential NextRetryAfter/Quota.NextRecoverAt); quotaExceeded is
+		// passed as true unconditionally because a live credential-wide
+		// cooldown is always reported as blockReasonCooldown here,
+		// regardless of whether it originated from credential_quota or a
+		// CredentialCooldown-marked failure like a 401.
+		if next := effectiveDeadline(auth, "", now); !next.IsZero() {
+			if blocked, _, until := availabilityBlock(true, true, next, time.Time{}, now); blocked {
+				return true, blockReasonCooldown, until
+			}
+		}
 	}
-	if model != "" {
+	if modelKey != "" {
 		if len(auth.ModelStates) > 0 {
-			modelKey := canonicalModelKey(model)
+			modelKey := canonicalModelKey(modelKey)
 			matched := false
 			blocked := false
 			blockedReason := blockReasonNone
@@ -854,18 +886,96 @@ func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, block
 	return availabilityBlock(auth.Unavailable, quotaExceeded, auth.NextRetryAfter, auth.Quota.NextRecoverAt, now)
 }
 
+// laterFutureDeadline returns the latest of deadlines that is still after
+// now, or the zero Time when none of them are. This is the single piece of
+// arithmetic shared by availabilityBlock and effectiveDeadline so the two
+// can never disagree about which of several deadline fields is currently
+// live and which one wins when more than one is.
+func laterFutureDeadline(now time.Time, deadlines ...time.Time) time.Time {
+	var next time.Time
+	for _, candidate := range deadlines {
+		if candidate.After(now) && (next.IsZero() || candidate.After(next)) {
+			next = candidate
+		}
+	}
+	return next
+}
+
+// genuineCredentialDeadline returns the latest live deadline held by a
+// GENUINE credential-wide cooldown field on auth: auth.NextRetryAfter only
+// counts when auth.CredentialCooldown marks it as a real credential-wide
+// failure (e.g. a 401), and auth.Quota.NextRecoverAt only counts when
+// auth.Quota.Reason is "credential_quota". Either field can also hold an
+// AGGREGATE-ONLY value instead - auth.NextRetryAfter/auth.Quota copied up
+// from ModelStates by updateAggregatedAvailability (which stamps
+// Reason="quota", not "credential_quota", for that case) - and an
+// aggregate-only value must never be mistaken for a deadline that applies
+// to every model; see effectiveDeadline's modelKey!="" branch, which is the
+// only reason this distinction exists.
+func genuineCredentialDeadline(auth *Auth, now time.Time) time.Time {
+	if auth == nil {
+		return time.Time{}
+	}
+	var next time.Time
+	if auth.CredentialCooldown {
+		next = laterFutureDeadline(now, next, auth.NextRetryAfter)
+	}
+	if auth.Quota.Reason == "credential_quota" {
+		next = laterFutureDeadline(now, next, auth.Quota.NextRecoverAt)
+	}
+	return next
+}
+
+// effectiveDeadline is the single accessor for "what is the latest live
+// cooldown deadline for auth" - at the credential level alone (modelKey ==
+// "") or for a specific model (modelKey != ""). modelKey may be a raw model
+// string or an already-canonical key - it is canonicalized here before
+// matching against auth.ModelStates keys, the same way effectiveBlock's
+// per-model loop does. Fields that are zero, or already in the past, do not
+// contribute; the result is the zero Time when nothing is currently live.
+//
+// Credential-level and model-level queries deliberately use different rules
+// for auth.NextRetryAfter/auth.Quota.NextRecoverAt (2026-09-04 review,
+// finding 1 - cross-model cooldown contamination): a credential-level query
+// (modelKey=="") wants the credential's OWN observable state as a whole, so
+// it uses those two fields unconditionally, aggregate-derived or not - that
+// aggregate IS the answer to "is this credential, taken as a whole,
+// available." A model-level query, in contrast, must not let an
+// aggregate-only value that was actually derived from a DIFFERENT sibling
+// model leak onto this one; only a genuine credential-wide deadline
+// (see genuineCredentialDeadline) may apply to every model.
+func effectiveDeadline(auth *Auth, modelKey string, now time.Time) time.Time {
+	if auth == nil {
+		return time.Time{}
+	}
+	modelKey = canonicalModelKey(modelKey)
+	var next time.Time
+	if modelKey == "" {
+		next = laterFutureDeadline(now, auth.NextRetryAfter, auth.Quota.NextRecoverAt)
+	} else {
+		next = genuineCredentialDeadline(auth, now)
+	}
+	if modelKey == "" || len(auth.ModelStates) == 0 {
+		return next
+	}
+	for stateModel, state := range auth.ModelStates {
+		if state == nil || canonicalModelKey(stateModel) != modelKey {
+			continue
+		}
+		if candidate := laterFutureDeadline(now, state.NextRetryAfter, state.Quota.NextRecoverAt); candidate.After(next) {
+			next = candidate
+		}
+	}
+	return next
+}
+
 func availabilityBlock(unavailable, quotaExceeded bool, nextRetryAfter, nextRecoverAt, now time.Time) (bool, blockReason, time.Time) {
 	if !unavailable && !quotaExceeded {
 		return false, blockReasonNone, time.Time{}
 	}
 
 	hasRecoveryTime := !nextRetryAfter.IsZero() || !nextRecoverAt.IsZero()
-	var next time.Time
-	for _, candidate := range []time.Time{nextRetryAfter, nextRecoverAt} {
-		if candidate.After(now) && (next.IsZero() || candidate.After(next)) {
-			next = candidate
-		}
-	}
+	next := laterFutureDeadline(now, nextRetryAfter, nextRecoverAt)
 	if !next.IsZero() {
 		if quotaExceeded {
 			return true, blockReasonCooldown, next

@@ -509,6 +509,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			if !restoreExecutionModel {
 				execReq = attachResolvedAPIKeyModelInfo(routing, execReq, auth, routeModel, upstreamModel)
 			}
+			sentModel := execReq.Model
 			startExec := time.Now()
 			resp, errExec := executor.Execute(execCtx, auth, execReq, execOpts)
 			errExec = markUpstreamExecutionAttemptFromContext(execCtx, errExec)
@@ -545,7 +546,8 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			if errCancel := claudeOAuthRequestCancellation(execCtx, auth, errExec); errCancel != nil {
 				return cliproxyexecutor.Response{}, errCancel
 			}
-			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, RouteModel: routeModel, Success: errExec == nil, Options: execOpts}
+			wireModel := preferWireModel(wireModelFromError(errExec), wireModelOrSent(resp, sentModel))
+			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, UpstreamModel: wireModel, RouteModel: routeModel, Success: errExec == nil, Options: execOpts}
 			if errExec != nil {
 				result.Error = resultErrorFromError(errExec)
 				if ra := retryAfterFromError(errExec); ra != nil {
@@ -700,6 +702,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			if !restoreExecutionModel {
 				execReq = attachResolvedAPIKeyModelInfo(routing, execReq, auth, routeModel, upstreamModel)
 			}
+			sentModel := execReq.Model
 			startExec := time.Now()
 			resp, errExec := executor.CountTokens(execCtx, auth, execReq, execOpts)
 			errExec = markUpstreamExecutionAttemptFromContext(execCtx, errExec)
@@ -736,7 +739,8 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			if errCancel := claudeOAuthRequestCancellation(execCtx, auth, errExec); errCancel != nil {
 				return cliproxyexecutor.Response{}, errCancel
 			}
-			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, RouteModel: routeModel, Success: errExec == nil, Options: execOpts, SkipQuotaObservation: true}
+			countTokensWireModel := preferWireModel(wireModelFromError(errExec), wireModelOrSent(resp, sentModel))
+			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, UpstreamModel: countTokensWireModel, RouteModel: routeModel, Success: errExec == nil, Options: execOpts, SkipQuotaObservation: true}
 			if errExec != nil {
 				result.Error = resultErrorFromError(errExec)
 				if ra := retryAfterFromError(errExec); ra != nil {
@@ -747,8 +751,12 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 				// Some Anthropic-compatible upstreams do not implement the
 				// count_tokens route and return a generic endpoint 404. Record
 				// the failure for hooks and metrics without suspending a model
-				// that remains usable through the messages endpoint.
-				if isCountTokensEndpointNotFoundError(errExec, execReq.Model) && (result.Error == nil || result.Error.Code != ErrorCodeForceCooldown) {
+				// that remains usable through the messages endpoint. Classify
+				// against the wire model an executor actually sent (e.g. Kimi's
+				// kimi-k3 -> k3 normalization), not the pre-normalization
+				// request model, or a 404 naming the wire model reads as
+				// endpoint-unsupported instead of explicit not-found.
+				if isCountTokensEndpointNotFoundError(errExec, countTokensWireModel) && (result.Error == nil || result.Error.Code != ErrorCodeForceCooldown) {
 					m.recordAvailabilityNeutralResult(execCtx, result)
 				} else {
 					if isCredentialScopedError(errExec) {
@@ -1169,6 +1177,83 @@ func authSelectionModelFromOptions(opts cliproxyexecutor.Options, fallback strin
 		}
 	}
 	return fallback
+}
+
+// wireModelOrSent prefers the exact model an executor reports having placed
+// on the outbound upstream request (via Response.Metadata) over the
+// pre-call model captured before executor-internal normalization (e.g.
+// Claude stripping a thinking suffix, Kimi remapping an alias), so a
+// structured 404 naming the wire model classifies correctly.
+func wireModelOrSent(resp cliproxyexecutor.Response, sent string) string {
+	reported := ""
+	if resp.Metadata != nil {
+		if v, ok := resp.Metadata[cliproxyexecutor.WireModelMetadataKey].(string); ok {
+			reported = strings.TrimSpace(v)
+		}
+	}
+	return preferWireModel(reported, sent)
+}
+
+// wireModelOrSentStream mirrors wireModelOrSent for the streaming path: a
+// streaming executor that normalizes the model internally (Kimi remapping an
+// alias, Claude stripping a thinking suffix) reports the exact wire model via
+// StreamResult.Metadata, captured before the first chunk is emitted, since a
+// StreamResult carries no per-chunk Response to attach it to on success.
+func wireModelOrSentStream(metadata map[string]any, sent string) string {
+	reported := ""
+	if metadata != nil {
+		if v, ok := metadata[cliproxyexecutor.WireModelMetadataKey].(string); ok {
+			reported = strings.TrimSpace(v)
+		}
+	}
+	return preferWireModel(reported, sent)
+}
+
+// wireModelFromError extracts the wire model an executor attached to an
+// error via a WireModel() string method, mirroring wireModelOrSent's
+// Response.Metadata channel for paths (ExecuteStream) that return no
+// Response on failure and so must carry the wire model on the error itself.
+func wireModelFromError(err error) string {
+	if err == nil {
+		return ""
+	}
+	type wireModelProvider interface {
+		WireModel() string
+	}
+	var wmp wireModelProvider
+	if errors.As(err, &wmp) && wmp != nil {
+		return strings.TrimSpace(wmp.WireModel())
+	}
+	return ""
+}
+
+// preferWireModel returns the reported wire model when known, else the
+// pre-call sent model. Both wireModelOrSent (Response.Metadata) and
+// wireModelFromError (error-carried) funnel through here so every entry
+// point shares one precedence rule instead of repeating it.
+func preferWireModel(reported, sent string) string {
+	if reported != "" {
+		return reported
+	}
+	return sent
+}
+
+// bootstrapStreamWireModel resolves the wire model for a stream bootstrap
+// failure Result. A bootstrap error can surface as a structured error value
+// (wireModelFromError, via a WireModel() wrapper) or, when ExecuteStream
+// already succeeded and only the first *chunk* was a structured failure
+// without that wrapper, as StreamResult.Metadata captured before the first
+// chunk was emitted (see wireModelOrSentStream). Checking wireModelFromError
+// alone and falling straight through to sent silently drops a normalized
+// model an executor already reported via metadata - the same class of gap
+// wireModelOrSentStream exists to close on the success path. Every bootstrap
+// Result constructor should funnel through here instead of calling
+// preferWireModel(wireModelFromError(err), sent) directly.
+func bootstrapStreamWireModel(bootstrapErr error, metadata map[string]any, sent string) string {
+	if reported := wireModelFromError(bootstrapErr); reported != "" {
+		return reported
+	}
+	return wireModelOrSentStream(metadata, sent)
 }
 
 func executionModelForAuthSelection(opts cliproxyexecutor.Options, model string) (string, bool) {
