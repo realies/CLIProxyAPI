@@ -3,6 +3,8 @@ package management
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -128,6 +130,117 @@ func TestResetQuota_DoesNotAcceptAuthIDOrFileName(t *testing.T) {
 
 			if rec.Code != tt.wantCode {
 				t.Fatalf("status = %d, want %d with body %s", rec.Code, tt.wantCode, rec.Body.String())
+			}
+		})
+	}
+}
+
+// fakeRedeemExecutor is a codex executor that only knows how to redeem; the
+// embedded interface satisfies ProviderExecutor for registration.
+type fakeRedeemExecutor struct {
+	coreauth.ProviderExecutor
+	manager       *coreauth.Manager
+	err           error
+	calls         int
+	authID        string
+	stillExceeded bool
+}
+
+func (f *fakeRedeemExecutor) Identifier() string { return "codex" }
+
+func (f *fakeRedeemExecutor) RedeemQuotaReset(_ context.Context, auth *coreauth.Auth) (*coreauth.QuotaRedeemResult, error) {
+	f.calls++
+	f.authID = auth.ID
+	if current, ok := f.manager.GetByID(auth.ID); ok {
+		f.stillExceeded = current.Quota.Exceeded
+	}
+	if f.err != nil {
+		return nil, f.err
+	}
+	return &coreauth.QuotaRedeemResult{StatusCode: http.StatusOK, Body: json.RawMessage(`{"available_count":1}`)}, nil
+}
+
+func TestResetQuota_Redeem(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+
+	tests := []struct {
+		name         string
+		provider     string
+		redeemErr    error
+		body         string
+		wantCode     int
+		wantCalls    int
+		wantExceeded bool
+	}{
+		{name: "redeems then clears", provider: "codex", body: `{"auth_index":%q,"redeem":true}`, wantCode: http.StatusOK, wantCalls: 1},
+		{name: "refused redeem keeps cooldown", provider: "codex", redeemErr: errors.New("HTTP 402"), body: `{"auth_index":%q,"redeem":true}`, wantCode: http.StatusBadGateway, wantCalls: 1, wantExceeded: true},
+		{name: "unsupported credential kind keeps cooldown", provider: "codex", redeemErr: coreauth.ErrQuotaRedeemUnsupported, body: `{"auth_index":%q,"redeem":true}`, wantCode: http.StatusUnprocessableEntity, wantCalls: 1, wantExceeded: true},
+		{name: "provider without executor keeps cooldown", provider: "claude", body: `{"auth_index":%q,"redeem":true}`, wantCode: http.StatusUnprocessableEntity, wantExceeded: true},
+		{name: "default never redeems", provider: "codex", body: `{"auth_index":%q}`, wantCode: http.StatusOK},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			manager := coreauth.NewManager(nil, nil, nil)
+			fake := &fakeRedeemExecutor{manager: manager, err: tt.redeemErr}
+			manager.RegisterExecutor(fake)
+			next := time.Now().Add(time.Hour)
+			auth := &coreauth.Auth{
+				ID:       "redeem-" + tt.provider,
+				FileName: "redeem-" + tt.provider + ".json",
+				Provider: tt.provider,
+				Status:   coreauth.StatusError,
+				Quota:    coreauth.QuotaState{Exceeded: true, Reason: "quota", NextRecoverAt: next, BackoffLevel: 2},
+			}
+			authIndex := auth.EnsureIndex()
+			if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+				t.Fatalf("failed to register auth record: %v", errRegister)
+			}
+			h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+
+			rec := httptest.NewRecorder()
+			ctx, _ := gin.CreateTestContext(rec)
+			req := httptest.NewRequest(http.MethodPost, "/v0/management/reset-quota", strings.NewReader(fmt.Sprintf(tt.body, authIndex)))
+			req.Header.Set("Content-Type", "application/json")
+			ctx.Request = req
+			h.ResetQuota(ctx)
+
+			if rec.Code != tt.wantCode {
+				t.Fatalf("status = %d, want %d with body %s", rec.Code, tt.wantCode, rec.Body.String())
+			}
+			if fake.calls != tt.wantCalls {
+				t.Fatalf("redeem calls = %d, want %d", fake.calls, tt.wantCalls)
+			}
+			updated, ok := manager.GetByID(auth.ID)
+			if !ok || updated == nil {
+				t.Fatalf("expected auth record to exist after reset")
+			}
+			if updated.Quota.Exceeded != tt.wantExceeded {
+				t.Fatalf("quota exceeded = %v, want %v", updated.Quota.Exceeded, tt.wantExceeded)
+			}
+			if tt.wantCalls == 0 {
+				return
+			}
+			if fake.authID != auth.ID {
+				t.Fatalf("redeemed auth = %q, want %q", fake.authID, auth.ID)
+			}
+			if !fake.stillExceeded {
+				t.Fatalf("local cooldown was cleared before the redeem")
+			}
+			if tt.wantCode != http.StatusOK {
+				return
+			}
+			var payload struct {
+				Redeem struct {
+					StatusCode int             `json:"status_code"`
+					Body       json.RawMessage `json:"body"`
+				} `json:"redeem"`
+			}
+			if errUnmarshal := json.Unmarshal(rec.Body.Bytes(), &payload); errUnmarshal != nil {
+				t.Fatalf("failed to decode response: %v", errUnmarshal)
+			}
+			if payload.Redeem.StatusCode != http.StatusOK || string(payload.Redeem.Body) != `{"available_count":1}` {
+				t.Fatalf("redeem outcome = %+v, want provider answer passed through", payload.Redeem)
 			}
 		})
 	}
